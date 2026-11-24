@@ -78,9 +78,11 @@ For single-device causal SFT with FP32 or BF16 activations and output-head dropo
 `sft_supervised_projection_tiles` to a positive value below `num_vocab_tiling`.
 The decoder still processes the full sequence. With FP32 activations, the loss
 gathers rows whose shifted target segmentation is nonzero. With BF16 activations,
-the scan keeps original tile boundaries and skips tiles with no supervised
-targets. If the selected rows or occupied tiles exceed the configured capacity,
-the step uses the original tiled path.
+the scan keeps original tile boundaries and skips projection and loss on tiles
+with no targets. When the model exposes final normalization separately, as in
+the legacy Transformer, the scan applies it outside the skip branch to preserve
+the BF16 rounding of its backward pass. If the selected rows or occupied tiles
+exceed the configured capacity, the scan processes all vocabulary tiles.
 
 For example, with a batch of one, sequence length 2,048, and
 `num_vocab_tiling=8`, setting `sft_supervised_projection_tiles=1` uses one
@@ -88,9 +90,8 @@ For example, with a batch of one, sequence length 2,048, and
 single original tile. The default of zero uses all vocabulary tiles.
 For a new BF16 model or input shape, verify loss and raw gradient parity on
 the target workload with the paired SFT benchmark before enabling the option.
-On GPU, use `compile_xla_flags="--xla_gpu_deterministic_ops=True"` if the
-compiled tiled and sparse steps diverge. Use the same compiler setting for
-both arms when checking parity and comparing runtime.
+For a separate deterministic GPU comparison, use
+`compile_xla_flags="--xla_gpu_deterministic_ops=True"` in both arms.
 
 ### Other Tiling Methods
 

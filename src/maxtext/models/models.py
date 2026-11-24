@@ -176,13 +176,19 @@ class Transformer(nnx.Module):
     """A no-op method to allow the model to be used in a lazy context."""
     return
 
-  def logits_from_hidden_states_for_vocab_tiling(self, hidden_states, deterministic, model_mode):
+  def normalize_hidden_states_for_vocab_tiling(self, hidden_states):
+    """Apply the final normalization independently of the vocabulary projection."""
+    return self.decoder.apply_decoder_norm(hidden_states)
+
+  def logits_from_hidden_states_for_vocab_tiling(self, hidden_states, deterministic, model_mode, *, normalize_y=True):
     """Computes logits from hidden states; used by vocabulary tiling."""
     return self.decoder.apply_output_head(
         shared_embedding=self.token_embedder,
         y=hidden_states,
         deterministic=deterministic,
         model_mode=model_mode,
+        normalize_y=normalize_y,
+        reduce_mhc=normalize_y,
     )
 
   def init_cache(self, cache_size: int, batch_size: int, dtype=jnp.float32):

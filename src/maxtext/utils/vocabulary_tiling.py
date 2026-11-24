@@ -80,6 +80,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
   supervised_tiles = config.sft_supervised_projection_tiles
   skip_empty_bf16_tiles = supervised_tiles > 0 and hidden_states.dtype == jnp.bfloat16
+  separate_norm = skip_empty_bf16_tiles and hasattr(model, "normalize_hidden_states_for_vocab_tiling")
   if supervised_tiles and model.mesh is not None and model.mesh.size != 1:
     raise ValueError("sft_supervised_projection_tiles currently requires a single-device mesh.")
   deterministic = not config.enable_dropout if is_train else True
@@ -178,23 +179,27 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
         emb_dim,
     )
 
-  def _single_chunk_loss_fn(
-      input_head_params,
-      input_other_params,
-      input_rest,
-      input_hidden_chunk,
-      input_label_chunk,
-      input_segmentation_chunk,
-  ):
-    chunk_logits = _logits_for_chunk(input_head_params, input_other_params, input_rest, input_hidden_chunk)
-    one_hot_label_chunk = jax.nn.one_hot(input_label_chunk, config.vocab_size)
-    chunk_xent, chunk_z_loss = max_utils.cross_entropy_with_logits(
-        chunk_logits, one_hot_label_chunk, z_loss=config.z_loss_multiplier
-    )
-    mask = input_segmentation_chunk != 0
-    masked_xent = jnp.sum(chunk_xent * mask)
-    masked_z_loss = jnp.sum(chunk_z_loss * mask)
-    return masked_xent, masked_z_loss
+  def _single_chunk_loss_fn(head, other, rest, hidden, labels, segments, run_projection=None):
+    def compute_loss(logits):
+      one_hot = jax.nn.one_hot(labels, config.vocab_size)
+      xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot, z_loss=config.z_loss_multiplier)
+      mask = segments != 0
+      return jnp.sum(xent * mask), jnp.sum(z_loss * mask)
+
+    if run_projection is None:
+      return compute_loss(_logits_for_chunk(head, other, rest, hidden))
+
+    local_model = nnx.merge(graphdef, head, other, rest, copy=True)
+    normalized = local_model.normalize_hidden_states_for_vocab_tiling(hidden)
+
+    def project_and_compute_loss(normalized):
+      logits = local_model.logits_from_hidden_states_for_vocab_tiling(
+          normalized, deterministic, model_mode, normalize_y=False
+      )
+      return compute_loss(_maybe_shard_with_name(logits, chunked_logits_spec))
+
+    zero = jnp.zeros((), dtype=jnp.float32)
+    return jax.lax.cond(run_projection, project_and_compute_loss, lambda _: (zero, zero), normalized)
 
   def _run_tiles(body, initial_acc, chunk_data, save_hidden_grads=False):
     if not skip_empty_bf16_tiles:
@@ -203,6 +208,11 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     # Preserve the full scan geometry for BF16's rounded backward pass.
     active = jnp.any(chunk_data[2], axis=1)
     can_skip = jnp.count_nonzero(active) <= supervised_tiles
+
+    if separate_norm:
+      # Keep final RMSNorm and its transpose outside the conditional. Moving
+      # the norm inside changes rare BF16 rounding decisions under GPU XLA.
+      return jax.lax.scan(body, initial_acc, (*chunk_data, active | ~can_skip))
 
     def skip_tile(accumulators, tile):
       return accumulators, jnp.zeros_like(tile[0]) if save_hidden_grads else None
@@ -228,7 +238,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
     def _fwd_scan_body(accumulators, chunk_data):
       loss_accumulator, z_loss_accumulator = accumulators
-      hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+      hidden_chunk, label_chunk, segmentation_chunk, *run_projection = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
       segmentation_chunk = _maybe_shard_with_name(segmentation_chunk, chunked_data_spec)
@@ -240,6 +250,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
           hidden_chunk,
           label_chunk,
           segmentation_chunk,
+          *run_projection,
       )
       return (loss_accumulator + masked_xent, z_loss_accumulator + masked_z_loss), None
 
@@ -270,14 +281,14 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
     def _fwd_and_bwd_scan_body(accumulators, chunk_data):
       loss_accumulator, z_loss_accumulator, grad_head_acc = accumulators
-      hidden_chunk, label_chunk, segmentation_chunk = chunk_data
+      hidden_chunk, label_chunk, segmentation_chunk, *run_projection = chunk_data
       hidden_chunk = _maybe_shard_with_name(hidden_chunk, chunked_hidden_spec)
       label_chunk = _maybe_shard_with_name(label_chunk, chunked_data_spec)
       segmentation_chunk = _maybe_shard_with_name(segmentation_chunk, chunked_data_spec)
 
       # pylint: disable=unnecessary-lambda-assignment
       loss_fn_for_vg = lambda p, h: _single_chunk_loss_fn(
-          p, chunk_other_params, chunk_rest, h, label_chunk, segmentation_chunk
+          p, chunk_other_params, chunk_rest, h, label_chunk, segmentation_chunk, *run_projection
       )
       (masked_xent, masked_z_loss), (grad_head_update, grad_hidden_chunk) = jax.value_and_grad(
           loss_fn_for_vg, argnums=(0, 1), has_aux=True

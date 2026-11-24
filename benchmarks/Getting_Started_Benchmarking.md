@@ -22,12 +22,12 @@ python -m benchmarks.supervised_sft_projection \
   --checkpoint-layout safetensors_dynamic \
   --load-parameters-path "$QWEN_CHECKPOINT" --tokenizer-path "$QWEN_CHECKPOINT" \
   --batches /tmp/qasper-s4096.npz --output-directory /tmp/maxtext-sft-results \
-  --compile-xla-flags=--xla_gpu_deterministic_ops=True \
   --scan-layers true --warmup 4 --repeats 32
 ```
 
 Repeat with the Qwen3-0.6B checkpoint and `--model-name qwen3-0.6b` to compare model sizes on the same NPZ.
-The deterministic GPU option is passed to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
+For a separate deterministic comparison, add `--compile-xla-flags=--xla_gpu_deterministic_ops=True`.
+The runner applies that option to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
 
 The runner checks every batch by default and stops before timing when parity fails. The report includes the batch SHA-256, supervised token counts, compiler flags, per-batch parity, and raw paired timings. Keep model and batch revisions, precision, compiler options, and device topology fixed for each comparison.
 
