@@ -27,7 +27,6 @@ import os
 from pathlib import Path
 from time import perf_counter
 from contextlib import nullcontext
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from flax import nnx
@@ -157,7 +156,34 @@ def preference_batches(args, tokenizer):
   raise ValueError("The local parquet files did not contain enough usable preference pairs.")
 
 
-def stream_logit_cotangent(project, normalized, targets, cotangent, logits_shape, logits_dtype, chunk_size):
+def for_score_tiles(buffer, write_tile, completion_width, chunk_size, active_width):
+  """Keep the existing tile shapes while bounding the loop to the live prefix."""
+  full_chunks, tail = divmod(completion_width, chunk_size)
+  if full_chunks:
+    active_chunks = jnp.minimum(full_chunks, (active_width + chunk_size - 1) // chunk_size)
+    buffer = jax.lax.fori_loop(0, active_chunks, lambda i, b: write_tile(b, i * chunk_size, chunk_size), buffer)
+  if tail:
+    offset = full_chunks * chunk_size
+    buffer = jax.lax.cond(active_width > offset, lambda b: write_tile(b, offset, tail), lambda b: b, buffer)
+  return buffer
+
+
+def prefix_scores(project, normalized, targets, chunk_size, active_width):
+  """Score the live completion prefix with the same hidden-row geometry."""
+
+  def write_tile(buffer, offset, size):
+    hidden = jax.lax.dynamic_slice_in_dim(normalized, offset, size, axis=1)
+    hidden = jnp.where(jnp.isfinite(hidden), hidden, 0.0)
+    ids = jax.lax.dynamic_slice_in_dim(targets, offset, size, axis=1)
+    scores = common.selective_log_softmax(project(hidden).astype(jnp.float32), ids)
+    return jax.lax.dynamic_update_slice_in_dim(buffer, scores, offset, axis=1)
+
+  return for_score_tiles(
+      jnp.zeros(targets.shape, dtype=jnp.float32), write_tile, targets.shape[1], chunk_size, active_width
+  )
+
+
+def stream_logit_cotangent(project, normalized, targets, cotangent, logits_shape, logits_dtype, chunk_size, active_width):
   """Build the full-width head cotangent from bounded score tiles."""
   completion_width = targets.shape[1]
   completion_start = normalized.shape[1] - completion_width - 1
@@ -171,16 +197,11 @@ def stream_logit_cotangent(project, normalized, targets, cotangent, logits_shape
     (logit_cotangent,) = score_vjp(score_cotangent)
     return jax.lax.dynamic_update_slice_in_dim(buffer, logit_cotangent, completion_start + offset, axis=1)
 
-  full_chunks, tail = divmod(completion_width, chunk_size)
   buffer = jnp.zeros(logits_shape, dtype=logits_dtype)
-  if full_chunks:
-    buffer = jax.lax.fori_loop(0, full_chunks, lambda i, b: write_tile(b, i * chunk_size, chunk_size), buffer)
-  if tail:
-    buffer = write_tile(buffer, full_chunks * chunk_size, tail)
-  return buffer
+  return for_score_tiles(buffer, write_tile, completion_width, chunk_size, active_width)
 
 
-def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size):
+def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size, active_width):
   """Tile score computation while keeping the native full-width projection pullback."""
 
   def is_head(path, variable):
@@ -203,23 +224,22 @@ def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size):
 
     return base.normalize_hidden_states_for_vocab_tiling(hidden_states), project
 
-  def tiled(head_params, state, hidden_states, ids):
+  def tiled(head_params, state, hidden_states, ids, width):
     local = nnx.merge(graph, head_params, state, copy=True)
     # Normalize before slicing so the forward scores keep the dense numerics.
     normalized, project = normalized_head(local, hidden_states)
     suffix = normalized[:, -completion_width - 1 : -1, :]
-    head = SimpleNamespace(compute_final_logits=project)
-    return common.compute_chunked_logps(head, suffix, ids, 1.0, chunk_size, False)
+    return prefix_scores(project, suffix, ids, chunk_size, width)
 
   @jax.custom_vjp
-  def score(head_params, state, hidden_states, ids):
-    return tiled(head_params, state, hidden_states, ids)
+  def score(head_params, state, hidden_states, ids, width):
+    return tiled(head_params, state, hidden_states, ids, width)
 
-  def forward(head_params, state, hidden_states, ids):
-    return tiled(head_params, state, hidden_states, ids), (head_params, state, hidden_states, ids)
+  def forward(head_params, state, hidden_states, ids, width):
+    return tiled(head_params, state, hidden_states, ids, width), (head_params, state, hidden_states, ids, width)
 
   def backward(residuals, cotangent):
-    head_params, state, hidden_states, ids = residuals
+    head_params, state, hidden_states, ids, width = residuals
 
     def full_projection(params, activations):
       return nnx.merge(graph, params, state, copy=True).compute_final_logits(activations)
@@ -229,12 +249,14 @@ def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size):
     # Use only the shape and dtype of the full projection's primal. Keeping
     # the original dot geometry preserves BF16 rounding in the pullback.
     logits, pullback = jax.vjp(full_projection, head_params, hidden_states)
-    logit_cotangent = stream_logit_cotangent(project, normalized, ids, cotangent, logits.shape, logits.dtype, chunk_size)
+    logit_cotangent = stream_logit_cotangent(
+        project, normalized, ids, cotangent, logits.shape, logits.dtype, chunk_size, width
+    )
     parameter_gradient, hidden_gradient = pullback(logit_cotangent)
-    return parameter_gradient, None, hidden_gradient, None
+    return parameter_gradient, None, hidden_gradient, None, None
 
   score.defvjp(forward, backward)
-  return score(head, rest, hidden, targets)
+  return score(head, rest, hidden, targets, active_width)
 
 
 def chunked_scorer(chunk_size):
@@ -245,7 +267,12 @@ def chunked_scorer(chunk_size):
       raise ValueError("This benchmark supports text preference pairs.")
     hidden, _ = model(input_tokens, positions, None, attn_mask, skip_lm_head=True)
     targets = input_tokens[:, -logits_to_keep:]
-    return chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size)
+    active_width = logits_to_keep
+    if attn_mask is not None:
+      # The Tunix causal mask's last query carries the full input-token mask.
+      valid = jnp.any(attn_mask[:, -1, -logits_to_keep:].astype(jnp.bool_), axis=0)
+      active_width = jnp.max(jnp.where(valid, jnp.arange(1, logits_to_keep + 1), 0))
+    return chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size, active_width)
 
   return score
 
@@ -432,7 +459,7 @@ def main():
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
       "chunk_size": args.chunk_size,
-      "scorer": "chunked_scores_streamed_cotangent" if args.chunk_size else "dense",
+      "scorer": "masked_chunked_scores_streamed_cotangent" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
       "pairs_per_step": args.pairs_per_step,
       "prompt_slots": args.prompt_slots,
