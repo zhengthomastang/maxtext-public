@@ -77,6 +77,12 @@ Add `--donate-policy` to let the native AdamW update reuse policy parameter buff
 
 For the lower-budget BFC runs, use `--chunk-size 0 --donate-policy` at `XLA_CLIENT_MEM_FRACTION=0.55` on Qwen3-1.7B, and `--chunk-size 128 --donate-policy` at `0.60` on Qwen3-4B. Keep preallocation disabled and use the same empty XLA compiler flags file. Run native dense with stock donation at the default BFC budget as the deployment baseline and at the candidate budget as a capacity control. Save gradients from the stock native scorer before running either donated arm. Record each arm's budget with its latency and sampled memory.
 
+##### Precompute a fixed reference
+
+For a fixed checkpoint and tokenized cohort, add `--reference-cache "$DPO_BENCHMARK_DIR/reference-scores.json" --build-reference-cache` to the model and data flags with `--chunk-size 0`. This runs native reference scoring and exits. Use a separate `--output` path for its report. In a new process, pass the same `--reference-cache` with `--chunk-size 0 --donate-policy` and omit `--build-reference-cache`. This run attaches the saved scores to native Tunix inputs and runs the same DPO loss and policy update. The key checks the checkpoint shards, model and scoring code, tokenized cohort, mesh, and compiler options.
+
+Keep the BFC budget identical in the cache process, cached training, and online dense control. Sample memory during cache construction and during training. Compare the maximum of those two cached phases against the online update window. Record cache construction separately from steady p90, and include it in a total or amortized throughput when scoring reuse pays for it. Use preference pairs and completion tokens per second for useful throughput. If reporting model FLOPs utilization, count the reference forward on online steps and account for the one-time scoring separately on the cached path. [MaxText MFU definition](https://maxtext.readthedocs.io/en/maxtext-v0.2.6/reference/performance_metrics.html)
+
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
 

@@ -62,6 +62,10 @@ def parse_args():
   parser.add_argument("--tensor-parallel-size", type=int, default=1)
   parser.add_argument("--stream-checkpoint", action="store_true", help="Stream the dynamic safetensors conversion.")
   parser.add_argument("--donate-policy", action="store_true", help="Reuse policy parameter buffers in the native update.")
+  parser.add_argument("--reference-cache", type=Path, help="Read frozen reference scores for this checkpoint and cohort.")
+  parser.add_argument(
+      "--build-reference-cache", action="store_true", help="Score the cohort in a separate process and exit."
+  )
   parser.add_argument(
       "--profile-memory", action="store_true", help="Mark the full-step window for an external GPU sampler."
   )
@@ -77,6 +81,8 @@ def parse_args():
     parser.error("Use a nonnegative chunk size. Zero selects the dense scorer.")
   if args.profile_memory and not args.cohort_sha256:
     parser.error("--profile-memory requires --cohort-sha256 from the completed parity run.")
+  if args.build_reference_cache and (args.reference_cache is None or args.chunk_size or args.donate_policy):
+    parser.error("Build the reference cache with --reference-cache, --chunk-size 0, and stock donation.")
   if (
       min(
           args.repeats,
@@ -385,7 +391,7 @@ def compare_with_saved_gradients(root, gradient, save):
 
 
 def parity(trainer, args, batches, cohort):
-  dense = args.chunk_size == 0 and not args.donate_policy
+  dense = args.chunk_size == 0 and not args.donate_policy and args.reference_cache is None
   cohort_path = args.parity_directory / "cohort.json"
   if dense and not args.profile_memory:
     args.parity_directory.mkdir(parents=True, exist_ok=True)
@@ -455,16 +461,19 @@ def time_steps(trainer, args, batches):
   example = trainer._prepare_inputs(batches[0])
   compiled = step.func.lower(*step.args, example, is_update).compile()
   policy_memory = compiled_memory(compiled)
-  reference = dpo_trainer.compute_logps.lower(
-      trainer.ref_model,
-      example.input_ids,
-      example.positions,
-      example.attention_mask,
-      example.logits_to_keep,
-      example.completion_mask,
-  ).compile()
-  reference_memory = compiled_memory(reference)
-  del reference, example
+  reference_memory = None
+  if trainer.ref_model is not None:
+    reference = dpo_trainer.compute_logps.lower(
+        trainer.ref_model,
+        example.input_ids,
+        example.positions,
+        example.attention_mask,
+        example.logits_to_keep,
+        example.completion_mask,
+    ).compile()
+    reference_memory = compiled_memory(reference)
+    del reference
+  del example
   samples = []
   losses = []
   if args.profile_memory:
@@ -496,50 +505,151 @@ def time_steps(trainer, args, batches):
   }
 
 
+class CachedReferenceTrainer(dpo_trainer.DPOTrainer):
+  """Prepare Tunix inputs normally and attach the verified reference log probabilities."""
+
+  def __init__(self, model, optimizer, config, batches, scores, mesh):
+    super().__init__(model, None, optimizer, config)
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    self._scores = {
+        id(batch): tuple(jax.device_put(row, replicated) for row in pair)
+        for batch, pair in zip(batches, scores, strict=True)
+    }
+    jax.block_until_ready(tuple(self._scores.values()))
+
+  def _prepare_inputs(self, input_data):
+    example = super()._prepare_inputs(input_data)
+    chosen, rejected = self._scores[id(input_data)]
+    return example.replace(ref_chosen_logps=chosen, ref_rejected_logps=rejected)
+
+
+def reference_cache_key(args, cohort, tunix_version):
+  shards = sorted(args.checkpoint.glob("*.safetensors"))
+  if not shards:
+    raise ValueError("A reference cache requires a local safetensors checkpoint.")
+  checksums = {}
+  for path in shards:
+    with path.open("rb") as handle:
+      checksums[path.name] = hashlib.file_digest(handle, "sha256").hexdigest()
+  config = args.checkpoint / "config.json"
+  runtime = hashlib.sha256()
+  source_root = Path(MAXTEXT_PKG_DIR)
+  for path in sorted(source_root.rglob("*")):
+    if path.suffix in (".py", ".yml", ".yaml"):
+      runtime.update(path.relative_to(source_root).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+  for module in (dpo_trainer, common):
+    runtime.update(Path(module.__file__).read_bytes())
+  flags = os.environ.get("XLA_FLAGS", "")
+  flag_file = Path(flags) if flags else None
+  compiler_options = flag_file.read_text(encoding="utf-8") if flag_file and flag_file.is_file() else flags
+  return {
+      "schema_version": 1,
+      "scorer": "native_tunix_dense_bf16_fp32_parameters",
+      "model": args.model_name,
+      "checkpoint_sha256": checksums,
+      "checkpoint_config_sha256": hashlib.sha256(config.read_bytes()).hexdigest() if config.is_file() else None,
+      "cohort_sha256": cohort["tokenized_sha256"],
+      "batch_shape": [args.cohort_batches, args.pairs_per_step, args.prompt_slots, args.completion_slots],
+      "tensor_parallel_size": args.tensor_parallel_size,
+      "device": jax.devices()[0].device_kind,
+      "jax": jax.__version__,
+      "tunix_version": tunix_version,
+      "reference_runtime_sha256": runtime.hexdigest(),
+      "compiler_options_sha256": hashlib.sha256(compiler_options.encode()).hexdigest(),
+  }
+
+
+def build_reference_cache(model, config, args, batches, key):
+  trainer = dpo_trainer.DPOTrainer(model, model, optax.identity(), config)
+  scores, scoring_ms = [], []
+  for batch in batches:
+    start = perf_counter()
+    example = trainer._prepare_inputs(batch)
+    scores.append(np.asarray(jax.block_until_ready((example.ref_chosen_logps, example.ref_rejected_logps))).tolist())
+    scoring_ms.append((perf_counter() - start) * 1000)
+  args.reference_cache.parent.mkdir(parents=True, exist_ok=True)
+  temp = args.reference_cache.with_name(f".{args.reference_cache.name}.{os.getpid()}.tmp")
+  try:
+    temp.write_text(json.dumps({"key": key, "scores": scores}, allow_nan=False) + "\n", encoding="utf-8")
+    temp.replace(args.reference_cache)
+  finally:
+    temp.unlink(missing_ok=True)
+  return scoring_ms
+
+
+def read_reference_cache(args, key):
+  cached = json.loads(args.reference_cache.read_text(encoding="utf-8"))
+  if cached["key"] != key:
+    raise ValueError("Reference cache key differs from the checkpoint, cohort, mesh, or runtime.")
+  scores = np.asarray(cached["scores"], dtype=np.float32)
+  if scores.shape != (args.cohort_batches, 2, args.pairs_per_step) or not np.isfinite(scores).all():
+    raise ValueError("Reference cache has invalid scores.")
+  return scores
+
+
 def main():
   args = parse_args()
   if jax.device_count() != args.tensor_parallel_size:
     raise RuntimeError("Expose exactly the requested number of accelerators to this benchmark.")
   args.output.parent.mkdir(parents=True, exist_ok=True)
+  if args.build_reference_cache:
+    begin = perf_counter()
+    print("DPO_GPU_MEMORY_WINDOW_BEGIN", flush=True)
   cfg = make_config(args)
   mesh = maxtext_utils.get_mesh_from_config(cfg)
   tokenizer = AutoTokenizer.from_pretrained(args.checkpoint, local_files_only=True)
   if tokenizer.pad_token_id is None:
     raise ValueError("The checkpoint tokenizer needs a pad token.")
+  try:
+    tunix_version = version("google-tunix")
+  except PackageNotFoundError:
+    tunix_version = None
+  train_config = dpo_trainer.DPOTrainingConfig(
+      max_steps=cfg.steps, eval_every_n_steps=0, gradient_accumulation_steps=1, algorithm="dpo"
+  )
   # Scope the injection to this benchmark. The production Tunix path is unchanged.
   scorer_context = (
       patch.object(common, "get_per_token_logps", chunked_scorer(args.chunk_size)) if args.chunk_size else nullcontext()
   )
   with scorer_context, mesh, jax.set_mesh(mesh), logical_axis_rules(cfg.logical_axis_rules):
+    batches, cohort = preference_batches(args, tokenizer_adapter.TokenizerAdapter(tokenizer))
+    if args.cohort_sha256 and cohort["tokenized_sha256"] != args.cohort_sha256:
+      raise ValueError(f'Tokenized cohort differs from --cohort-sha256: {cohort["tokenized_sha256"]}')
+    cache_key = reference_cache_key(args, cohort, tunix_version) if args.reference_cache is not None else None
     model = model_creation_utils.from_pretrained(
         cfg, mesh=mesh, wrap_with_tunix_adapter=True, tokenizer_pad_id=tokenizer.pad_token_id
     )
+    if args.build_reference_cache:
+      scoring_ms = build_reference_cache(model, train_config, args, batches, cache_key)
+      build_ms = (perf_counter() - begin) * 1000
+      print("DPO_GPU_MEMORY_WINDOW_END", flush=True)
+      report = {
+          "status": "reference_cache_built",
+          "cache_key": cache_key,
+          "cohort": cohort,
+          "build_ms": build_ms,
+          "scoring_ms": scoring_ms,
+          "allocator_after_build": allocator_memory(),
+      }
+      args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+      return 0
     learning_rate = maxtext_utils.create_learning_rate_schedule(cfg)
     optimizer = optimizers.get_optimizer(cfg, learning_rate, model)
     if cfg.gradient_clipping_threshold > 0:
       optimizer = optax.chain(optax.clip_by_global_norm(cfg.gradient_clipping_threshold), optimizer)
-    # Donation requires the frozen reference to own separate device buffers.
-    reference = nnx.clone(model, arrays=args.donate_policy)
-    if args.donate_policy:
-      jax.block_until_ready(nnx.state(reference))
-    trainer = dpo_trainer.DPOTrainer(
-        model,
-        reference,
-        optimizer,
-        dpo_trainer.DPOTrainingConfig(
-            max_steps=cfg.steps, eval_every_n_steps=0, gradient_accumulation_steps=1, algorithm="dpo"
-        ),
-    )
-    batches, cohort = preference_batches(args, tokenizer_adapter.TokenizerAdapter(tokenizer))
-    if args.cohort_sha256 and cohort["tokenized_sha256"] != args.cohort_sha256:
-      raise ValueError(f'Tokenized cohort differs from --cohort-sha256: {cohort["tokenized_sha256"]}')
+    if args.reference_cache is not None:
+      trainer = CachedReferenceTrainer(
+          model, optimizer, train_config, batches, read_reference_cache(args, cache_key), mesh
+      )
+    else:
+      # Donation requires the frozen reference to own separate device buffers.
+      reference = nnx.clone(model, arrays=args.donate_policy)
+      if args.donate_policy:
+        jax.block_until_ready(nnx.state(reference))
+      trainer = dpo_trainer.DPOTrainer(model, reference, optimizer, train_config)
     numerical_checks = parity(trainer, args, batches, cohort)
     passes = all(result["passed"] is not False for result in numerical_checks)
     timing = time_steps(trainer, args, batches) if passes else None
-  try:
-    tunix_version = version("google-tunix")
-  except PackageNotFoundError:
-    tunix_version = None
   report = {
       "scope": "native_tunix_dpo_step_with_maxtext_model",
       "status": "profiled_memory" if args.profile_memory else "timed" if passes else "parity_failed",
@@ -552,6 +662,7 @@ def main():
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
       "donate_policy": args.donate_policy,
+      "reference_scoring": "precomputed" if args.reference_cache is not None else "online",
       "chunk_size": args.chunk_size,
       "scorer": "compact_completion_rows_paired_tail" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
