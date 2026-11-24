@@ -39,7 +39,7 @@ Keep XLA compiler defaults for the primary comparison. Explicit sharding and `--
 
 #### Paired BF16 DPO benchmark
 
-Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/tree/a017fdb8622de655b55e156f32c11c9dda5c2af9) and expose one H100. Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B snapshot](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), `ORCA_PARQUET` to a directory containing the pinned [Argilla ORCA training Parquet](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896), and `DPO_BENCHMARK_DIR` to a scratch directory with at least 20 GiB free for saved raw gradients. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
+Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/commit/21fa70f92aadd966cea68efcb73c9786710b8c46) and expose one H100. Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B snapshot](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), `ORCA_PARQUET` to a directory containing the pinned [Argilla ORCA training Parquet](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896), and `DPO_BENCHMARK_DIR` to a scratch directory with at least 20 GiB free for saved raw gradients. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
 
 ```bash
 mkdir -p "$DPO_BENCHMARK_DIR"
