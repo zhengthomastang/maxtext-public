@@ -79,13 +79,14 @@ For causal SFT with FP32 or BF16 activations and output-head dropout disabled, s
 The decoder still processes the full sequence. With FP32 activations, the loss
 gathers rows whose shifted target segmentation is nonzero. With BF16 activations,
 the scan keeps original tile boundaries and skips projection and loss on tiles
-with no targets. When the model exposes final normalization separately, as in
-the legacy Transformer, the scan applies it outside the skip branch to preserve
-the BF16 rounding of its backward pass. If the selected rows or occupied tiles
+with no targets. The legacy Transformer normally applies final normalization
+outside the skip branch to preserve BF16 gradient parity. With an untied head
+under automatic tensor sharding, the scan skips the entire empty tile to
+preserve parity in the compiled decoder backward pass. If the selected rows or occupied tiles
 exceed the configured capacity, the scan processes all vocabulary tiles.
 
-The BF16 path with separate final normalization also supports a tensor-only
-mesh, where the target mask is replicated across the tensor axis.
+The BF16 path supports a tensor-only mesh for models that expose separate final
+normalization. Replicate the target mask across the tensor axis.
 
 For example, with a batch of one, sequence length 2,048, and
 `num_vocab_tiling=8`, setting `sft_supervised_projection_tiles=1` uses one

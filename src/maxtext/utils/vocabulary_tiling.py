@@ -80,7 +80,13 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
   supervised_tiles = config.sft_supervised_projection_tiles
   skip_empty_bf16_tiles = supervised_tiles > 0 and hidden_states.dtype == jnp.bfloat16
-  separate_norm = skip_empty_bf16_tiles and hasattr(model, "normalize_hidden_states_for_vocab_tiling")
+  can_split_norm = skip_empty_bf16_tiles and hasattr(model, "normalize_hidden_states_for_vocab_tiling")
+  multi_device = model.mesh is not None and model.mesh.size > 1
+  # In AUTO tensor parallelism, splitting the untied head's backward across
+  # the conditional can change the decoder's BF16 backward lowering.
+  separate_norm = can_split_norm and not (
+      multi_device and config.shard_mode == ShardMode.AUTO and not config.logits_via_embedding
+  )
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
 
@@ -100,16 +106,16 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
       model.mesh,
       ("num_tile", "activation_embed_and_logits_batch_sequence"),
   )
-  if supervised_tiles and model.mesh is not None and model.mesh.size != 1:
+  if supervised_tiles and multi_device:
     # A replicated target mask keeps the branch predicate uniform across the mesh.
     if (
-        not separate_norm
+        not can_split_norm
         or model.mesh.shape.get("tensor") != model.mesh.size
         or not reshaped_data_spec.is_fully_replicated
     ):
       raise ValueError(
-          "Multi-device supervised projection requires BF16, split normalization, and a tensor-only mesh "
-          "with replicated targets."
+          "Multi-device supervised projection requires a BF16 head that exposes separate normalization "
+          "and a tensor-only mesh with replicated targets."
       )
   chunked_hidden_spec = create_sharding(
       model.mesh,
