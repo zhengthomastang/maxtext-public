@@ -156,123 +156,117 @@ def preference_batches(args, tokenizer):
   raise ValueError("The local parquet files did not contain enough usable preference pairs.")
 
 
-def for_score_tiles(buffer, write_tile, completion_width, chunk_size, active_width):
-  """Keep the existing tile shapes while bounding the loop to the live prefix."""
-  full_chunks, tail = divmod(completion_width, chunk_size)
-  if full_chunks:
-    active_chunks = jnp.minimum(full_chunks, (active_width + chunk_size - 1) // chunk_size)
-    buffer = jax.lax.fori_loop(0, active_chunks, lambda i, b: write_tile(b, i * chunk_size, chunk_size), buffer)
-  if tail:
-    offset = full_chunks * chunk_size
-    buffer = jax.lax.cond(active_width > offset, lambda b: write_tile(b, offset, tail), lambda b: b, buffer)
-  return buffer
+def active_rows(mask, tile_rows):
+  """Pack valid target rows in sequence order and pad to a static tile shape."""
+  flat = mask.reshape(-1)
+  width = flat.size
+  slots = ((width + tile_rows - 1) // tile_rows) * tile_rows
+  count = jnp.count_nonzero(flat)
+  positions = jnp.nonzero(flat, size=slots, fill_value=width)[0]
+  order = jnp.arange(slots, dtype=positions.dtype)
+  # Unique sorted out-of-range rows let scatter drop the padding safely.
+  positions = jnp.where(order < count, positions, width + order)
+  return positions, (count + tile_rows - 1) // tile_rows
 
 
-def prefix_scores(project, normalized, targets, chunk_size, active_width):
-  """Score the live completion prefix with the same hidden-row geometry."""
+def tile_inputs(position_tiles, index, hidden, targets):
+  positions = position_tiles[index]
+  selected = jnp.take(hidden, positions, axis=0, mode="fill", fill_value=0)
+  selected = jnp.where(jnp.isfinite(selected), selected, 0)
+  ids = jnp.take(targets, positions, axis=0, mode="fill", fill_value=0)
+  return positions, selected, ids
 
-  def write_tile(buffer, offset, size):
-    hidden = jax.lax.dynamic_slice_in_dim(normalized, offset, size, axis=1)
-    hidden = jnp.where(jnp.isfinite(hidden), hidden, 0.0)
-    ids = jax.lax.dynamic_slice_in_dim(targets, offset, size, axis=1)
-    scores = common.selective_log_softmax(project(hidden).astype(jnp.float32), ids)
-    return jax.lax.dynamic_update_slice_in_dim(buffer, scores, offset, axis=1)
 
-  return for_score_tiles(
-      jnp.zeros(targets.shape, dtype=jnp.float32), write_tile, targets.shape[1], chunk_size, active_width
+def is_head(path, variable):
+  return isinstance(variable, nnx.Param) and any(
+      str(part) in {"token_embedder", "decoder_norm", "logits_dense"} for part in path
   )
 
 
-def stream_logit_cotangent(project, normalized, targets, cotangent, logits_shape, logits_dtype, chunk_size, active_width):
-  """Build the full-width head cotangent from bounded score tiles."""
-  completion_width = targets.shape[1]
-  completion_start = normalized.shape[1] - completion_width - 1
-
-  def write_tile(buffer, offset, size):
-    hidden_tile = jax.lax.dynamic_slice_in_dim(normalized, completion_start + offset, size, axis=1)
-    target_tile = jax.lax.dynamic_slice_in_dim(targets, offset, size, axis=1)
-    score_cotangent = jax.lax.dynamic_slice_in_dim(cotangent, offset, size, axis=1)
-    logits = project(hidden_tile)
-    _, score_vjp = jax.vjp(lambda values: common.selective_log_softmax(values, target_tile), logits)
-    (logit_cotangent,) = score_vjp(score_cotangent)
-    return jax.lax.dynamic_update_slice_in_dim(buffer, logit_cotangent, completion_start + offset, axis=1)
-
-  buffer = jnp.zeros(logits_shape, dtype=logits_dtype)
-  return for_score_tiles(buffer, write_tile, completion_width, chunk_size, active_width)
-
-
-def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size, active_width):
-  """Tile score computation while keeping the native full-width projection pullback."""
-
-  def is_head(path, variable):
-    return isinstance(variable, nnx.Param) and any(
-        str(item) in {"token_embedder", "decoder_norm", "logits_dense"} for item in path
-    )
-
+def compact_score(model, hidden, targets, mask, tile_rows):
+  """Stream compact scores and reconstruct the native logit cotangent."""
   graph, head, rest = nnx.split(model, is_head, ...)
-  # Decoder parameters receive their gradient through the hidden-state input.
   rest = jax.tree.map(jax.lax.stop_gradient, rest)
-  completion_width = targets.shape[1]
+  batch, completion = targets.shape
+  sequence = hidden.shape[1]
+  completion_start = sequence - completion - 1
 
-  def normalized_head(local, hidden_states):
+  def head_parts(params, state, states):
+    local = nnx.merge(graph, params, state, copy=True)
     base = local.base
+    normalized = base.normalize_hidden_states_for_vocab_tiling(states)
+    suffix = normalized[:, completion_start:-1, :]
 
     def project(activations):
       return base.logits_from_hidden_states_for_vocab_tiling(
           activations, deterministic=True, model_mode=base.model_mode, normalize_y=False
-      )
+      ).astype(jnp.float32)
 
-    return base.normalize_hidden_states_for_vocab_tiling(hidden_states), project
+    return suffix.reshape(-1, suffix.shape[-1]), project
 
-  def tiled(head_params, state, hidden_states, ids, width):
-    local = nnx.merge(graph, head_params, state, copy=True)
-    # Normalize before slicing so the forward scores keep the dense numerics.
-    normalized, project = normalized_head(local, hidden_states)
-    suffix = normalized[:, -completion_width - 1 : -1, :]
-    return prefix_scores(project, suffix, ids, chunk_size, width)
+  def primal(params, state, states, ids, positions, tiles):
+    rows, project = head_parts(params, state, states)
+    flat_ids = ids.reshape(-1)
+
+    def score_tile(index, buffer):
+      locations, selected, tokens = tile_inputs(positions, index, rows, flat_ids)
+      scores = common.selective_log_softmax(project(selected), tokens)
+      return buffer.at[locations].set(scores, mode="drop", indices_are_sorted=True, unique_indices=True)
+
+    scores = jax.lax.fori_loop(0, tiles, score_tile, jnp.zeros(batch * completion, jnp.float32))
+    return scores.reshape(batch, completion)
 
   @jax.custom_vjp
-  def score(head_params, state, hidden_states, ids, width):
-    return tiled(head_params, state, hidden_states, ids, width)
+  def scored(params, state, states, ids, positions, tiles):
+    return primal(params, state, states, ids, positions, tiles)
 
-  def forward(head_params, state, hidden_states, ids, width):
-    return tiled(head_params, state, hidden_states, ids, width), (head_params, state, hidden_states, ids, width)
+  def forward(params, state, states, ids, positions, tiles):
+    args = params, state, states, ids, positions, tiles
+    return primal(*args), args
 
-  def backward(residuals, cotangent):
-    head_params, state, hidden_states, ids, width = residuals
+  def backward(residual, cotangent):
+    params, state, states, ids, positions, tiles = residual
+    rows, project = head_parts(params, state, states)
+    flat_ids = ids.reshape(-1)
+    flat_score_cotangent = cotangent.reshape(-1)
 
-    def full_projection(params, activations):
-      return nnx.merge(graph, params, state, copy=True).compute_final_logits(activations)
+    def full_projection(candidate_params, candidate_hidden):
+      return nnx.merge(graph, candidate_params, state, copy=True).compute_final_logits(candidate_hidden)
 
-    local = nnx.merge(graph, head_params, state, copy=True)
-    normalized, project = normalized_head(local, hidden_states)
-    # Use only the shape and dtype of the full projection's primal. Keeping
-    # the original dot geometry preserves BF16 rounding in the pullback.
-    logits, pullback = jax.vjp(full_projection, head_params, hidden_states)
-    logit_cotangent = stream_logit_cotangent(
-        project, normalized, ids, cotangent, logits.shape, logits.dtype, chunk_size, width
-    )
-    parameter_gradient, hidden_gradient = pullback(logit_cotangent)
-    return parameter_gradient, None, hidden_gradient, None, None
+    # The full projection shape preserves BF16 rounding in the pullback.
+    logits, pullback = jax.vjp(full_projection, params, states)
 
-  score.defvjp(forward, backward)
-  return score(head, rest, hidden, targets, active_width)
+    def write_tile(index, buffer):
+      locations, selected, tokens = tile_inputs(positions, index, rows, flat_ids)
+      score_cotangent = jnp.take(flat_score_cotangent, locations, axis=0, mode="fill", fill_value=0)
+      values = project(selected)
+      _, score_vjp = jax.vjp(lambda logits: common.selective_log_softmax(logits, tokens), values)
+      (gradient,) = score_vjp(score_cotangent)
+      destination = (locations // completion) * sequence + completion_start + locations % completion
+      return buffer.at[destination].set(gradient, mode="drop", indices_are_sorted=True, unique_indices=True)
+
+    shape = batch * sequence, logits.shape[-1]
+    gradient = jax.lax.fori_loop(0, tiles, write_tile, jnp.zeros(shape, logits.dtype))
+    parameter_cotangent, hidden_cotangent = pullback(gradient.reshape(logits.shape))
+    return parameter_cotangent, None, hidden_cotangent, None, None, None
+
+  scored.defvjp(forward, backward)
+  positions, tiles = active_rows(mask, tile_rows)
+  return scored(head, rest, hidden, targets, positions.reshape(-1, tile_rows), tiles)
 
 
 def chunked_scorer(chunk_size):
-  """Use the experimental scorer inside Tunix's compiled DPO objective."""
-
   def score(model, input_tokens, positions, attn_mask, logits_to_keep, images=None):
     if images is not None:
       raise ValueError("This benchmark supports text preference pairs.")
     hidden, _ = model(input_tokens, positions, None, attn_mask, skip_lm_head=True)
     targets = input_tokens[:, -logits_to_keep:]
-    active_width = logits_to_keep
+    mask = jnp.ones_like(targets, dtype=jnp.bool_)
     if attn_mask is not None:
-      # The Tunix causal mask's last query carries the full input-token mask.
-      valid = jnp.any(attn_mask[:, -1, -logits_to_keep:].astype(jnp.bool_), axis=0)
-      active_width = jnp.max(jnp.where(valid, jnp.arange(1, logits_to_keep + 1), 0))
-    return chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size, active_width)
+      # The last query of Tunix's key-masked causal matrix has all valid keys.
+      mask = attn_mask[:, -1, -logits_to_keep:].astype(jnp.bool_)
+    tile_rows = chunk_size * targets.shape[0]
+    return compact_score(model, hidden, targets, mask, tile_rows)
 
   return score
 
@@ -459,7 +453,7 @@ def main():
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
       "chunk_size": args.chunk_size,
-      "scorer": "masked_chunked_scores_streamed_cotangent" if args.chunk_size else "dense",
+      "scorer": "compact_completion_rows_streamed_cotangent" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
       "pairs_per_step": args.pairs_per_step,
       "prompt_slots": args.prompt_slots,
