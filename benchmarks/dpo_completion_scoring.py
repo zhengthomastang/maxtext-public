@@ -385,7 +385,7 @@ def compare_with_saved_gradients(root, gradient, save):
 
 
 def parity(trainer, args, batches, cohort):
-  dense = args.chunk_size == 0
+  dense = args.chunk_size == 0 and not args.donate_policy
   cohort_path = args.parity_directory / "cohort.json"
   if dense and not args.profile_memory:
     args.parity_directory.mkdir(parents=True, exist_ok=True)

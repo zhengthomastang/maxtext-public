@@ -75,7 +75,7 @@ For peak GPU memory, repeat each passing arm in a fresh process with `--profile-
 
 Add `--donate-policy` to let the native AdamW update reuse policy parameter buffers. The frozen reference gets independent device storage and continues to score online.
 
-For the lower-budget BFC runs, use `--chunk-size 128 --donate-policy` and set `XLA_CLIENT_MEM_FRACTION=0.55` on Qwen3-1.7B or `0.60` on Qwen3-4B. Keep preallocation disabled and use the same empty XLA compiler flags file. Run native dense at the default BFC budget as the deployment baseline and at the candidate budget as a capacity control. Record each arm's budget with its latency and sampled memory.
+For the lower-budget BFC runs, use `--chunk-size 0 --donate-policy` at `XLA_CLIENT_MEM_FRACTION=0.55` on Qwen3-1.7B, and `--chunk-size 128 --donate-policy` at `0.60` on Qwen3-4B. Keep preallocation disabled and use the same empty XLA compiler flags file. Run native dense with stock donation at the default BFC budget as the deployment baseline and at the candidate budget as a capacity control. Save gradients from the stock native scorer before running either donated arm. Record each arm's budget with its latency and sampled memory.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
