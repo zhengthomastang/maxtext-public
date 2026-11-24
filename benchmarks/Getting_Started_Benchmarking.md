@@ -55,7 +55,7 @@ for chunk_size in 0 128; do
 done
 ```
 
-The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence, tiles the forward projection, and recomputes the original-width projection for the policy gradient. It checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and the AdamW update. Read the policy and reference XLA temporary estimates separately. The benchmark has its own scorer injection, and the normal MaxText DPO trainer continues to use native Tunix scoring.
+The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence and tiles score computation in both passes. The backward pass writes each score tile's logit cotangent into one full-width buffer, then applies the original projection pullback to preserve BF16 rounding. It checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and the AdamW update. Read the policy and reference XLA temporary estimates separately. The benchmark has its own scorer injection, and the normal MaxText DPO trainer continues to use native Tunix scoring.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:

@@ -157,8 +157,31 @@ def preference_batches(args, tokenizer):
   raise ValueError("The local parquet files did not contain enough usable preference pairs.")
 
 
-def chunked_logps_with_dense_pullback(model, hidden, targets, chunk_size):
-  """Tile forward scores and preserve the native full-width output-head derivative."""
+def stream_logit_cotangent(project, normalized, targets, cotangent, logits_shape, logits_dtype, chunk_size):
+  """Build the full-width head cotangent from bounded score tiles."""
+  completion_width = targets.shape[1]
+  completion_start = normalized.shape[1] - completion_width - 1
+
+  def write_tile(buffer, offset, size):
+    hidden_tile = jax.lax.dynamic_slice_in_dim(normalized, completion_start + offset, size, axis=1)
+    target_tile = jax.lax.dynamic_slice_in_dim(targets, offset, size, axis=1)
+    score_cotangent = jax.lax.dynamic_slice_in_dim(cotangent, offset, size, axis=1)
+    logits = project(hidden_tile)
+    _, score_vjp = jax.vjp(lambda values: common.selective_log_softmax(values, target_tile), logits)
+    (logit_cotangent,) = score_vjp(score_cotangent)
+    return jax.lax.dynamic_update_slice_in_dim(buffer, logit_cotangent, completion_start + offset, axis=1)
+
+  full_chunks, tail = divmod(completion_width, chunk_size)
+  buffer = jnp.zeros(logits_shape, dtype=logits_dtype)
+  if full_chunks:
+    buffer = jax.lax.fori_loop(0, full_chunks, lambda i, b: write_tile(b, i * chunk_size, chunk_size), buffer)
+  if tail:
+    buffer = write_tile(buffer, full_chunks * chunk_size, tail)
+  return buffer
+
+
+def chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size):
+  """Tile score computation while keeping the native full-width projection pullback."""
 
   def is_head(path, variable):
     return isinstance(variable, nnx.Param) and any(
@@ -170,17 +193,20 @@ def chunked_logps_with_dense_pullback(model, hidden, targets, chunk_size):
   rest = jax.tree.map(jax.lax.stop_gradient, rest)
   completion_width = targets.shape[1]
 
-  def tiled(head_params, state, hidden_states, ids):
-    local = nnx.merge(graph, head_params, state, copy=True)
-    # Normalize before slicing so the forward scores keep the dense numerics.
+  def normalized_head(local, hidden_states):
     base = local.base
-    normalized = base.normalize_hidden_states_for_vocab_tiling(hidden_states)
 
     def project(activations):
       return base.logits_from_hidden_states_for_vocab_tiling(
           activations, deterministic=True, model_mode=base.model_mode, normalize_y=False
       )
 
+    return base.normalize_hidden_states_for_vocab_tiling(hidden_states), project
+
+  def tiled(head_params, state, hidden_states, ids):
+    local = nnx.merge(graph, head_params, state, copy=True)
+    # Normalize before slicing so the forward scores keep the dense numerics.
+    normalized, project = normalized_head(local, hidden_states)
     suffix = normalized[:, -completion_width - 1 : -1, :]
     head = SimpleNamespace(compute_final_logits=project)
     return common.compute_chunked_logps(head, suffix, ids, 1.0, chunk_size, False)
@@ -195,14 +221,16 @@ def chunked_logps_with_dense_pullback(model, hidden, targets, chunk_size):
   def backward(residuals, cotangent):
     head_params, state, hidden_states, ids = residuals
 
-    def dense(params, activations):
-      local = nnx.merge(graph, params, state, copy=True)
-      logits = local.compute_final_logits(activations)[:, -completion_width - 1 : -1, :]
-      return common.selective_log_softmax(logits, ids)
+    def full_projection(params, activations):
+      return nnx.merge(graph, params, state, copy=True).compute_final_logits(activations)
 
-    # The original projection shape preserves the BF16 cotangent rounding.
-    _, pullback = jax.vjp(dense, head_params, hidden_states)
-    parameter_gradient, hidden_gradient = pullback(cotangent)
+    local = nnx.merge(graph, head_params, state, copy=True)
+    normalized, project = normalized_head(local, hidden_states)
+    # Use only the shape and dtype of the full projection's primal. Keeping
+    # the original dot geometry preserves BF16 rounding in the pullback.
+    logits, pullback = jax.vjp(full_projection, head_params, hidden_states)
+    logit_cotangent = stream_logit_cotangent(project, normalized, ids, cotangent, logits.shape, logits.dtype, chunk_size)
+    parameter_gradient, hidden_gradient = pullback(logit_cotangent)
     return parameter_gradient, None, hidden_gradient, None
 
   score.defvjp(forward, backward)
@@ -217,7 +245,7 @@ def chunked_scorer(chunk_size):
       raise ValueError("This benchmark supports text preference pairs.")
     hidden, _ = model(input_tokens, positions, None, attn_mask, skip_lm_head=True)
     targets = input_tokens[:, -logits_to_keep:]
-    return chunked_logps_with_dense_pullback(model, hidden, targets, chunk_size)
+    return chunked_logps_with_streamed_pullback(model, hidden, targets, chunk_size)
 
   return score
 
@@ -404,7 +432,7 @@ def main():
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
       "chunk_size": args.chunk_size,
-      "scorer": "chunked_forward_dense_pullback" if args.chunk_size else "dense",
+      "scorer": "chunked_scores_streamed_cotangent" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
       "pairs_per_step": args.pairs_per_step,
       "prompt_slots": args.prompt_slots,
