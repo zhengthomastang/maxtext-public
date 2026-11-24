@@ -74,7 +74,7 @@ In MaxText, the `num_vocab_tiling` configuration controls the number of tiles. T
 
 #### Supervised-position projection for SFT
 
-For single-device causal SFT with FP32 or BF16 activations and output-head dropout disabled, set
+For causal SFT with FP32 or BF16 activations and output-head dropout disabled, set
 `sft_supervised_projection_tiles` to a positive value below `num_vocab_tiling`.
 The decoder still processes the full sequence. With FP32 activations, the loss
 gathers rows whose shifted target segmentation is nonzero. With BF16 activations,
@@ -83,6 +83,9 @@ with no targets. When the model exposes final normalization separately, as in
 the legacy Transformer, the scan applies it outside the skip branch to preserve
 the BF16 rounding of its backward pass. If the selected rows or occupied tiles
 exceed the configured capacity, the scan processes all vocabulary tiles.
+
+The BF16 path with separate final normalization also supports a tensor-only
+mesh, where the target mask is replicated across the tensor axis.
 
 For example, with a batch of one, sequence length 2,048, and
 `num_vocab_tiling=8`, setting `sft_supervised_projection_tiles=1` uses one

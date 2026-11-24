@@ -55,6 +55,8 @@ def parse_args():
   parser.add_argument("--attention", default="dot_product")
   parser.add_argument("--matmul-precision", choices=["default", "high", "highest"], default="highest")
   parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
+  parser.add_argument("--tensor-parallel-size", type=int, default=1, help="Use this many GPUs with a replicated batch.")
+  parser.add_argument("--shard-mode", choices=["auto", "explicit"], help="Override MaxText's sharding mode in both arms.")
   parser.add_argument("--z-loss-multiplier", default=1e-4, type=float)
   parser.add_argument("--scan-layers", choices=["true", "false"])
   parser.add_argument("--warmup", default=3, type=int)
@@ -66,6 +68,8 @@ def parse_args():
   tile_count = args.num_vocab_tiling
   if batch < 1 or seq < 2 or (args.parity_batches is not None and args.parity_batches < 1):
     parser.error("Require positive batch counts and a sequence length of at least two.")
+  if args.tensor_parallel_size < 1 or (args.tensor_parallel_size > 1 and args.dtype != "bfloat16"):
+    parser.error("Use a positive tensor parallel size. Multi-GPU supervised projection requires BF16.")
   if tile_count < 2 or (batch * seq) % tile_count:
     parser.error("Use at least two tiles that divide the number of batch positions.")
   if not 0 < args.projection_tiles < tile_count:
@@ -95,7 +99,7 @@ def make_config(args, name, projection_tiles):
       "z_loss_multiplier": args.z_loss_multiplier,
       "max_target_length": args.max_target_length,
       "max_prefill_predict_length": min(128, args.max_target_length // 2),
-      "per_device_batch_size": args.batch_size,
+      "per_device_batch_size": args.batch_size / args.tensor_parallel_size,
       "num_vocab_tiling": args.num_vocab_tiling,
       "sft_supervised_projection_tiles": projection_tiles,
       "opt_type": args.optimizer,
@@ -122,6 +126,11 @@ def make_config(args, name, projection_tiles):
     overrides["compile_xla_flags"] = args.compile_xla_flags
   if args.scan_layers is not None:
     overrides["scan_layers"] = args.scan_layers
+  if args.shard_mode is not None:
+    overrides["shard_mode"] = args.shard_mode
+  if args.tensor_parallel_size > 1:
+    overrides["ici_tensor_parallelism"] = args.tensor_parallel_size
+    overrides["ici_fsdp_parallelism"] = 1
   path = Path(MAXTEXT_PKG_DIR) / "configs" / "post_train" / "sft.yml"
   return pyconfig.initialize([sys.argv[0], str(path), *(f"{key}={value}" for key, value in overrides.items())])
 
@@ -293,8 +302,8 @@ def check_parity(args, expected_count, baseline, candidate):
 
 def main():
   args = parse_args()
-  if jax.default_backend() != "gpu" or jax.device_count() != 1:
-    raise RuntimeError("Expose exactly one GPU to JAX for this benchmark.")
+  if jax.default_backend() != "gpu" or jax.device_count() != args.tensor_parallel_size:
+    raise RuntimeError("Expose exactly --tensor-parallel-size GPUs to JAX for this benchmark.")
   args.output_directory.mkdir(parents=True, exist_ok=True)
   configs = {
       "tiled": make_config(args, "tiled", 0),
@@ -358,6 +367,8 @@ def main():
         "scope": "native_sft_step",
         "device": jax.devices()[0].device_kind,
         "device_count": jax.device_count(),
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "shard_mode": baseline_config.shard_mode.value,
         "jax_version": jax.__version__,
         "model": args.model_name,
         "checkpoint": args.load_parameters_path,

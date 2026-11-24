@@ -7,7 +7,7 @@ Two approaches are here:
 
 #### Paired SFT benchmark
 
-`supervised_sft_projection.py` compares the tiled baseline and supervised projection through the native MaxText training step on one GPU. It checks loss, z-loss, and raw gradient parity before timing synchronized AdamW updates from the same checkpoint. It accepts a small built-in fixture or a pretokenized batch cohort.
+`supervised_sft_projection.py` compares the tiled baseline and supervised projection through the native MaxText training step. It checks loss, z-loss, and raw gradient parity before timing synchronized AdamW updates from the same checkpoint. It accepts a small built-in fixture or a pretokenized batch cohort.
 
 For example, download the public [QASPER training archive](https://allenai.org/data/qasper) and use a local copy of the [Qwen3-1.7B checkpoint and tokenizer](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e):
 
@@ -26,6 +26,7 @@ python -m benchmarks.supervised_sft_projection \
 ```
 
 Repeat with the Qwen3-0.6B checkpoint and `--model-name qwen3-0.6b` to compare model sizes on the same NPZ.
+For Qwen3-4B and Qwen3-8B with the same AdamW recipe, expose four NVLink-connected H100 80 GB GPUs to JAX and add `--tensor-parallel-size 4 --shard-mode explicit`. Use each model's checkpoint and change `--model-name` to `qwen3-4b` or `qwen3-8b`. Both arms use the selected MaxText sharding mode. The input batch is replicated on the tensor mesh and its global size stays the same. Keep XLA at its default settings for this comparison.
 For a separate deterministic comparison, add `--compile-xla-flags=--xla_gpu_deterministic_ops=True`.
 The runner applies that option to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
 

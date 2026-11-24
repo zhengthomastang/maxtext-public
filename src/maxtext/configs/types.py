@@ -886,8 +886,9 @@ class LogitsAndLoss(BaseModel):
   sft_supervised_projection_tiles: NonNegativeInt = Field(
       0,
       description=(
-          "Single-device causal SFT with FP32 or BF16 activations. Maximum number of vocabulary tiles to run"
-          " on the sparse path. BF16 preserves original tile boundaries. Zero and overflow use all tiles."
+          "Causal SFT with FP32 or BF16 activations. Maximum number of vocabulary tiles to run on the sparse path."
+          " BF16 keeps original tile boundaries and supports a tensor-only mesh with separate final normalization."
+          " Zero and overflow use all tiles."
       ),
   )
   vocab_tiling_ag_once: bool = Field(

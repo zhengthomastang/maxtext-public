@@ -81,8 +81,6 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   supervised_tiles = config.sft_supervised_projection_tiles
   skip_empty_bf16_tiles = supervised_tiles > 0 and hidden_states.dtype == jnp.bfloat16
   separate_norm = skip_empty_bf16_tiles and hasattr(model, "normalize_hidden_states_for_vocab_tiling")
-  if supervised_tiles and model.mesh is not None and model.mesh.size != 1:
-    raise ValueError("sft_supervised_projection_tiles currently requires a single-device mesh.")
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
 
@@ -102,6 +100,17 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
       model.mesh,
       ("num_tile", "activation_embed_and_logits_batch_sequence"),
   )
+  if supervised_tiles and model.mesh is not None and model.mesh.size != 1:
+    # A replicated target mask keeps the branch predicate uniform across the mesh.
+    if (
+        not separate_norm
+        or model.mesh.shape.get("tensor") != model.mesh.size
+        or not reshaped_data_spec.is_fully_replicated
+    ):
+      raise ValueError(
+          "Multi-device supervised projection requires BF16, split normalization, and a tensor-only mesh "
+          "with replicated targets."
+      )
   chunked_hidden_spec = create_sharding(
       model.mesh,
       ("activation_embed_and_logits_batch_sequence", "activation_embed"),
