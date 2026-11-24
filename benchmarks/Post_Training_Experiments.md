@@ -103,3 +103,5 @@ Use the same BFC budget for the builder, cached training, and online dense contr
 ### Measure cold wall time
 
 Check the **0.5%** gradient gate separately, then validate the timed cohort against the parity run. Use fresh processes with `JAX_ENABLE_COMPILATION_CACHE=false`. Add `--skip-compiled-memory-analysis` to both training arms so the online process does no extra reference compilation for diagnostics. Include imports, checkpoint load, scoring, compilation, warm-ups, and measured steps. For the on-disk cache, sum builder and training wall times. Reverse the order and report steady p90 separately. Sample whole-process peak memory in independent runs.
+
+For BF16 runs, repeat the gradient gate in independent processes. Pass `--record-reference-scores` to both timing and memory runs. The `reference_scores_by_batch` field records the first chosen and rejected score vectors used for each batch. The runner copies them to the host after the update loop. Compare the measured score vectors with the paired dense values and record any mismatch as a failed comparison. Also require a separate raw-gradient check.

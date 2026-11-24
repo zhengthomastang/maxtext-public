@@ -72,6 +72,9 @@ def parse_args():
   parser.add_argument(
       "--skip-compiled-memory-analysis", action="store_true", help="Skip extra executable analysis during cold timing."
   )
+  parser.add_argument(
+      "--record-reference-scores", action="store_true", help="Report the first reference scores used for each batch."
+  )
   parser.add_argument("--chunk-size", type=int, required=True)
   parser.add_argument("--pairs-per-step", type=int, default=2)
   parser.add_argument("--cohort-batches", type=int, default=8)
@@ -479,24 +482,34 @@ def time_steps(trainer, args, batches):
   del example
   samples = []
   losses = []
+  reference_scores = {}
   if args.profile_memory:
     before = allocator_memory()
     print("DPO_GPU_MEMORY_WINDOW_BEGIN", flush=True)
   for index in range(args.warmup + args.repeats):
-    batch = batches[index % len(batches)]
+    batch_index = index % len(batches)
+    batch = batches[batch_index]
     start = perf_counter()
     example = trainer._prepare_inputs(batch)
     loss, _, _ = jax.block_until_ready(compiled(*step.args, example, is_update))
     if index >= args.warmup:
       samples.append((perf_counter() - start) * 1000)
       losses.append(float(loss))
+    if args.record_reference_scores and batch_index not in reference_scores:
+      reference_scores[batch_index] = (example.ref_chosen_logps, example.ref_rejected_logps)
   memory = {
       "policy_step_compiled_memory": policy_memory,
       "reference_forward_compiled_memory": reference_memory,
   }
   if args.profile_memory:
     print("DPO_GPU_MEMORY_WINDOW_END", flush=True)
-    return {**memory, "allocator_before_steps": before, "allocator_after_steps": allocator_memory()}
+    memory.update(allocator_before_steps=before, allocator_after_steps=allocator_memory())
+  if args.record_reference_scores:
+    memory["reference_scores_by_batch"] = {
+        index: [np.asarray(row).tolist() for row in scores] for index, scores in jax.device_get(reference_scores).items()
+    }
+  if args.profile_memory:
+    return memory
   p10, median, p90 = np.percentile(samples, (10, 50, 90))
   return {
       **memory,
