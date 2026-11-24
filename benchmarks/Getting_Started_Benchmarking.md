@@ -73,6 +73,10 @@ The runner checks all eight matched batches at a **0.5%** raw-gradient relative 
 
 For peak GPU memory, repeat each passing arm in a fresh process with `--profile-memory` and a separate output path. The profile reuses the verified cohort and runs the same updates without repeating the gradient capture. Sample physical GPU memory on the isolated devices between the `DPO_GPU_MEMORY_WINDOW_BEGIN` and `DPO_GPU_MEMORY_WINDOW_END` log markers. Keep the same allocator settings and report the peak per device. The JSON records allocator counters at each boundary and separate XLA temporary-memory estimates for policy and reference. Use the original runs for latency.
 
+Add `--donate-policy` to let the native AdamW update reuse policy parameter buffers. The frozen reference gets independent device storage and continues to score online.
+
+For the lower-budget BFC runs, use `--chunk-size 128 --donate-policy` and set `XLA_CLIENT_MEM_FRACTION=0.55` on Qwen3-1.7B or `0.60` on Qwen3-4B. Keep preallocation disabled and use the same empty XLA compiler flags file. Run native dense at the default BFC budget as the deployment baseline and at the candidate budget as a capacity control. Record each arm's budget with its latency and sampled memory.
+
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
 

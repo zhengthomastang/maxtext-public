@@ -20,6 +20,7 @@ directory, and parity directory. See Getting_Started_Benchmarking.md.
 
 
 import argparse
+from functools import partial
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import json
@@ -60,6 +61,7 @@ def parse_args():
   parser.add_argument("--cohort-sha256", help="Require this exact tokenized cohort in both arms.")
   parser.add_argument("--tensor-parallel-size", type=int, default=1)
   parser.add_argument("--stream-checkpoint", action="store_true", help="Stream the dynamic safetensors conversion.")
+  parser.add_argument("--donate-policy", action="store_true", help="Reuse policy parameter buffers in the native update.")
   parser.add_argument(
       "--profile-memory", action="store_true", help="Mark the full-step window for an external GPU sampler."
   )
@@ -446,6 +448,9 @@ def allocator_memory():
 def time_steps(trainer, args, batches):
   """Time frozen reference preparation and the compiled native policy update."""
   step, _ = trainer.jit_train_and_eval_step()
+  if args.donate_policy:
+    donated_step = nnx.jit(trainer.create_train_step_fn(), donate_argnames=("model", "optimizer", "grad_accumulator"))
+    step = partial(donated_step, *step.args)
   is_update = jnp.asarray(True)
   example = trainer._prepare_inputs(batches[0])
   compiled = step.func.lower(*step.args, example, is_update).compile()
@@ -513,9 +518,13 @@ def main():
     optimizer = optimizers.get_optimizer(cfg, learning_rate, model)
     if cfg.gradient_clipping_threshold > 0:
       optimizer = optax.chain(optax.clip_by_global_norm(cfg.gradient_clipping_threshold), optimizer)
+    # Donation requires the frozen reference to own separate device buffers.
+    reference = nnx.clone(model, arrays=args.donate_policy)
+    if args.donate_policy:
+      jax.block_until_ready(nnx.state(reference))
     trainer = dpo_trainer.DPOTrainer(
         model,
-        nnx.clone(model),
+        reference,
         optimizer,
         dpo_trainer.DPOTrainingConfig(
             max_steps=cfg.steps, eval_every_n_steps=0, gradient_accumulation_steps=1, algorithm="dpo"
@@ -542,6 +551,7 @@ def main():
       "dtype": "bfloat16",
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
+      "donate_policy": args.donate_policy,
       "chunk_size": args.chunk_size,
       "scorer": "compact_completion_rows_paired_tail" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
