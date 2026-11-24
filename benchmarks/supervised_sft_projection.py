@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 from maxtext.configs import pyconfig
 from maxtext.trainers.pre_train import train
-from maxtext.utils import sharding, train_utils
+from maxtext.utils import max_utils, sharding, train_utils
 from maxtext.utils.globals import MAXTEXT_PKG_DIR
 import numpy as np
 from transformers import AutoTokenizer
@@ -51,6 +51,7 @@ def parse_args():
   parser.add_argument("--num-vocab-tiling", default=8, type=int)
   parser.add_argument("--projection-tiles", default=1, type=int)
   parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+  parser.add_argument("--compile-xla-flags", default="", help="Apply the same MaxText compiler options to both paths.")
   parser.add_argument("--attention", default="dot_product")
   parser.add_argument("--matmul-precision", choices=["default", "high", "highest"], default="highest")
   parser.add_argument("--optimizer", choices=["adamw", "sgd"], default="adamw")
@@ -117,6 +118,8 @@ def make_config(args, name, projection_tiles):
       "tokenizer_path": args.tokenizer_path,
       "log_config": "false",
   }
+  if args.compile_xla_flags:
+    overrides["compile_xla_flags"] = args.compile_xla_flags
   if args.scan_layers is not None:
     overrides["scan_layers"] = args.scan_layers
   path = Path(MAXTEXT_PKG_DIR) / "configs" / "post_train" / "sft.yml"
@@ -208,6 +211,7 @@ def load_batches(args, vocab_size):
 
 
 def make_loss_and_gradient(model, config):
+  """Compile the raw-gradient check with the native train-step compiler options."""
   graph, params, rest = nnx.split(model, nnx.Param, ...)
 
   def objective(weights, non_params, batch):
@@ -215,7 +219,8 @@ def make_loss_and_gradient(model, config):
     loss, aux = train.loss_fn(local_model, config, dict(batch), None, None, is_train=True)
     return loss, (aux["z_loss"], aux["total_weights"])
 
-  evaluate = jax.jit(jax.value_and_grad(objective, has_aux=True))
+  compiler_options = max_utils.parse_libtpu_flags_to_dict(config.compile_xla_flags)
+  evaluate = jax.jit(jax.value_and_grad(objective, has_aux=True), compiler_options=compiler_options or None)
   return lambda batch: jax.block_until_ready(evaluate(params, rest, batch))
 
 
@@ -363,6 +368,7 @@ def main():
         "z_loss_multiplier": args.z_loss_multiplier,
         "attention": args.attention,
         "matmul_precision": args.matmul_precision,
+        "compile_xla_flags": baseline_config.compile_xla_flags,
         "optimizer": args.optimizer,
         "batch_size": args.batch_size,
         "sequence_length": args.max_target_length,

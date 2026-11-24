@@ -22,10 +22,14 @@ python -m benchmarks.supervised_sft_projection \
   --checkpoint-layout safetensors_dynamic \
   --load-parameters-path "$QWEN_CHECKPOINT" --tokenizer-path "$QWEN_CHECKPOINT" \
   --batches /tmp/qasper-s4096.npz --output-directory /tmp/maxtext-sft-results \
-  --scan-layers true --parity-batches 16 --warmup 4 --repeats 32
+  --compile-xla-flags=--xla_gpu_deterministic_ops=True \
+  --scan-layers true --warmup 4 --repeats 32
 ```
 
-The runner checks every batch by default and stops before timing when parity fails. The report includes the batch SHA-256, supervised token counts, per-batch parity, and raw paired timings. Keep model and batch revisions, precision, and device topology fixed for each comparison.
+Repeat with the Qwen3-0.6B checkpoint and `--model-name qwen3-0.6b` to compare model sizes on the same NPZ.
+The deterministic GPU option is passed to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
+
+The runner checks every batch by default and stops before timing when parity fails. The report includes the batch SHA-256, supervised token counts, compiler flags, per-batch parity, and raw paired timings. Keep model and batch revisions, precision, compiler options, and device topology fixed for each comparison.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:

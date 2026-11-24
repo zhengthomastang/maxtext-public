@@ -88,6 +88,9 @@ For example, with a batch of one, sequence length 2,048, and
 single original tile. The default of zero uses all vocabulary tiles.
 For a new BF16 model or input shape, verify loss and raw gradient parity on
 the target workload with the paired SFT benchmark before enabling the option.
+On GPU, use `compile_xla_flags="--xla_gpu_deterministic_ops=True"` if the
+compiled tiled and sparse steps diverge. Use the same compiler setting for
+both arms when checking parity and comparing runtime.
 
 ### Other Tiling Methods
 
