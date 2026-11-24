@@ -7,9 +7,9 @@ Two approaches are here:
 
 #### Paired SFT benchmark
 
-`supervised_sft_projection.py` compares the tiled baseline and supervised projection through the native MaxText training step. It checks loss, z-loss, and raw gradient parity before timing synchronized AdamW updates from the same checkpoint. It accepts a small built-in fixture or a pretokenized batch cohort.
+The runner checks loss, z-loss, and raw-gradient parity before timing synchronized full AdamW steps. It replays the same tokenized batches, optimizer settings, and device topology within each pair. The JSON report captures batch hashes, batch order, compiler flags, per-batch checks, and p10, median, and p90 latency.
 
-For example, download the public [QASPER training archive](https://allenai.org/data/qasper) and use a local copy of the [Qwen3-1.7B checkpoint and tokenizer](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e):
+Download the public [QASPER archive](https://allenai.org/data/qasper) and use a local snapshot of [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e).
 
 ```bash
 python -m benchmarks.prepare_qasper_sft_batches \
@@ -25,17 +25,37 @@ python -m benchmarks.supervised_sft_projection \
   --scan-layers true --warmup 4 --repeats 32
 ```
 
-Repeat with the Qwen3-0.6B checkpoint and `--model-name qwen3-0.6b` to compare model sizes on the same NPZ.
-For Qwen3-4B and Qwen3-8B with the same AdamW recipe, expose four NVLink-connected H100 80 GB GPUs to JAX and add `--tensor-parallel-size 4 --shard-mode auto`. Use each model's checkpoint and change `--model-name` to `qwen3-4b` or `qwen3-8b`. Both arms use automatic sharding and the same replicated global batch. Keep XLA at its default settings for this comparison. Use `--shard-mode explicit` for a separate matched comparison.
+Keep the generated NPZ for the Qwen3 comparisons. Select the matching checkpoint and `--model-name` for each row. Expose the exact number of H100 80 GB devices to JAX.
 
-For Qwen3-14B and Qwen3-32B, expose eight NVLink-connected H100 80 GB GPUs and add `--tensor-parallel-size 8 --shard-mode auto --stream-checkpoint --sequential-arms`. Use the same NPZ with `--model-name qwen3-14b` and the [14B checkpoint](https://huggingface.co/Qwen/Qwen3-14B/tree/40c069824f4251a91eefaf281ebe4c544efd3e18) or `--model-name qwen3-32b` and the [32B checkpoint](https://huggingface.co/Qwen/Qwen3-32B/tree/9216db5781bf21249d130ec9da846c4624c16137). Sequential timing reloads the checkpoint and initializes fresh optimizer state for each arm. Both arms replay the same batches from the first warm-up. Loading and compilation are outside the timing. The report records the timing order.
+| Qwen3 size | Devices | Additional options |
+| --- | ---: | --- |
+| 0.6B, 1.7B | 1 | Defaults |
+| 4B, 8B | 4 | `--tensor-parallel-size 4 --shard-mode auto` |
+| [14B](https://huggingface.co/Qwen/Qwen3-14B/tree/40c069824f4251a91eefaf281ebe4c544efd3e18), [32B](https://huggingface.co/Qwen/Qwen3-32B/tree/9216db5781bf21249d130ec9da846c4624c16137) | 8 | `--tensor-parallel-size 8 --shard-mode auto --stream-checkpoint --sequential-arms` |
 
-For the eight-H100 runs, set `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`, `XLA_CLIENT_MEM_FRACTION=0.96`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false` in both arms. The default allocator failed on a temporary-buffer allocation during the 32B tiled step on the test pod. Keep XLA compiler flags at their defaults. [JAX GPU memory allocation](https://docs.jax.dev/en/latest/gpu_memory_allocation.html)
+Sequential timing reloads the same checkpoint and fresh optimizer state for each arm. It excludes loading and compilation. For the eight-GPU setup, use `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`, `XLA_CLIENT_MEM_FRACTION=0.96`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false` in both arms. The BFC allocator could not allocate the 32B tiled step's temporary buffers on the test node. [JAX GPU memory allocation](https://docs.jax.dev/en/latest/gpu_memory_allocation.html)
 
-For a separate deterministic comparison, add `--compile-xla-flags=--xla_gpu_deterministic_ops=True`.
-The runner applies that option to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
+Keep XLA compiler defaults for the primary comparison. Explicit sharding and `--compile-xla-flags=--xla_gpu_deterministic_ops=True` are separate comparisons. The runner applies either change to both arms.
 
-The runner checks every batch by default and stops before timing when parity fails. The report includes the batch SHA-256, supervised token counts, compiler flags, per-batch parity, and raw paired timings. Keep model and batch revisions, precision, compiler options, and device topology fixed for each comparison.
+#### Paired BF16 DPO benchmark
+
+Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/tree/a017fdb8622de655b55e156f32c11c9dda5c2af9) and expose one H100. Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B snapshot](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), `ORCA_PARQUET` to a directory containing the pinned [Argilla ORCA training Parquet](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896), and `DPO_BENCHMARK_DIR` to a scratch directory with at least 20 GiB free for saved raw gradients. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
+
+```bash
+mkdir -p "$DPO_BENCHMARK_DIR"
+: > "$DPO_BENCHMARK_DIR/xla-default.flags"
+export XLA_FLAGS="$DPO_BENCHMARK_DIR/xla-default.flags"
+
+for chunk_size in 0 128; do
+  python -m benchmarks.dpo_completion_scoring \
+    --checkpoint "$QWEN_CHECKPOINT" --preference-directory "$ORCA_PARQUET" \
+    --parity-directory "$DPO_BENCHMARK_DIR/reference" \
+    --output "$DPO_BENCHMARK_DIR/chunk-$chunk_size.json" \
+    --chunk-size "$chunk_size" || exit
+done
+```
+
+The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence, tiles the forward projection, and recomputes the original-width projection for the policy gradient. It checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and the AdamW update. Read the policy and reference XLA temporary estimates separately. The benchmark has its own scorer injection, and the normal MaxText DPO trainer continues to use native Tunix scoring.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
