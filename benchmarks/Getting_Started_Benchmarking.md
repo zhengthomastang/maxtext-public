@@ -1,87 +1,37 @@
-### Getting started with benchmark running in MaxText
+# Benchmarking with MaxText
 
-Two approaches are here:
+- **Run one recipe** to reproduce a known workload. See the [Trillium recipes](https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/trillium) or [DeepSeek-V3 on Ironwood](deepseek3_671b_tpu7x/README.md).
+- **Sweep model or cluster settings** with the [Cluster Toolkit recipes](#cluster-toolkit-benchmarks).
+- **Compare two post-training paths** with the [SFT and DPO experiments](Post_Training_Experiments.md).
 
-1. Run a model recipe with a single CLI command. Great to replicate performance results previously measured. See https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/trillium for examples, and [`deepseek3_671b_tpu7x/`](deepseek3_671b_tpu7x/README.md) for DeepSeek-V3 671B FP8 recipes on TPU7x (Ironwood).
-2. Run several experiments pythonically across a sweep of parameters (cluster configuration, maxtext parameters) with Cluster Toolkit workloads.
+## Standard MaxText metrics
 
-#### Paired SFT benchmark
+Report the baseline and candidate on the same workload after warm-up. Keep the model, batch shape, precision, device mesh, and compiler settings fixed.
 
-The runner checks loss, z-loss, and raw-gradient parity before timing synchronized full AdamW steps. It replays the same tokenized batches, optimizer settings, and device topology within each pair. The JSON report captures batch hashes, batch order, compiler flags, per-batch checks, and p10, median, and p90 latency.
+| Metric | Native key or calculation |
+| --- | --- |
+| Step time | `perf/step_time_seconds` |
+| Tokens/s/device | `perf/per_device_tokens_per_sec`. Uses configured sequence positions, including padding. |
+| Model TFLOP/s/device | `perf/per_device_tflops_per_sec`. Divides theoretical model TFLOPs per device per step by step time. |
+| Model FLOPs utilization (MFU) | Model TFLOP/s/device divided by the device's peak TFLOP/s for the reported precision. |
 
-Download the public [QASPER archive](https://allenai.org/data/qasper) and use a local snapshot of [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e).
+Use mean synchronized step time to derive aggregate throughput from standalone runners. State the token and FLOP counting conventions and the hardware peak. MFU comparisons are easiest to interpret when theoretical model work is fixed. When an optimization removes work, pair MFU with step time and token throughput. [MaxText metric logs](../docs/guides/monitoring_and_debugging/understand_logs_and_metrics.md) · [MFU definition](../docs/reference/performance_metrics.md)
 
-```bash
-python -m benchmarks.prepare_qasper_sft_batches \
-  --archive "$QASPER_ARCHIVE" --tokenizer-path "$QWEN_CHECKPOINT" \
-  --tokenizer-revision 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
-  --output /tmp/qasper-s4096.npz
+Keep raw timing, tail latency, useful work, correctness, peak memory, and startup costs in the [experiment report](Post_Training_Experiments.md).
 
-python -m benchmarks.supervised_sft_projection \
-  --model-name qwen3-1.7b --dtype bfloat16 --max-target-length 4096 \
-  --checkpoint-layout safetensors_dynamic \
-  --load-parameters-path "$QWEN_CHECKPOINT" --tokenizer-path "$QWEN_CHECKPOINT" \
-  --batches /tmp/qasper-s4096.npz --output-directory /tmp/maxtext-sft-results \
-  --scan-layers true --warmup 4 --repeats 32
-```
+## Paired SFT benchmark
 
-Keep the generated NPZ for the Qwen3 comparisons. Select the matching checkpoint and `--model-name` for each row. Expose the exact number of H100 80 GB devices to JAX.
+[Run the QASPER replay](Post_Training_Experiments.md#paired-sft-benchmark) to compare native vocabulary tiling with supervised-position projection.
 
-| Qwen3 size | Devices | Additional options |
-| --- | ---: | --- |
-| 0.6B, 1.7B | 1 | Defaults |
-| 4B, 8B | 4 | `--tensor-parallel-size 4 --shard-mode auto` |
-| [14B](https://huggingface.co/Qwen/Qwen3-14B/tree/40c069824f4251a91eefaf281ebe4c544efd3e18), [32B](https://huggingface.co/Qwen/Qwen3-32B/tree/9216db5781bf21249d130ec9da846c4624c16137) | 8 | `--tensor-parallel-size 8 --shard-mode auto --stream-checkpoint --sequential-arms` |
+## Paired BF16 DPO benchmark
 
-Sequential timing reloads the same checkpoint and fresh optimizer state for each arm. It excludes loading and compilation. For the eight-GPU setup, use `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`, `XLA_CLIENT_MEM_FRACTION=0.96`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false` in both arms. The BFC allocator could not allocate the 32B tiled step's temporary buffers on the test node. [JAX GPU memory allocation](https://docs.jax.dev/en/latest/gpu_memory_allocation.html)
+[Run the ORCA replay](Post_Training_Experiments.md#paired-bf16-dpo-benchmark) to compare dense with optimized DPO under matched compiler and allocator settings.
 
-Keep XLA compiler defaults for the primary comparison. Explicit sharding and `--compile-xla-flags=--xla_gpu_deterministic_ops=True` are separate comparisons. The runner applies either change to both arms.
+### Precompute a fixed reference
 
-#### Paired BF16 DPO benchmark
+[Measure frozen-reference reuse](Post_Training_Experiments.md#precompute-a-fixed-reference), including the cache-build cost in cold wall time and peak memory.
 
-Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/commit/21fa70f92aadd966cea68efcb73c9786710b8c46). Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e), or [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B/tree/1cfa9a7208912126459214e8b04321603b3df60c) snapshot. Set `ORCA_PARQUET` to the pinned [Argilla ORCA training Parquet directory](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896). Use a distinct `DPO_BENCHMARK_DIR` per model and device mesh, with room for raw gradients (20 GiB for 0.6B and 128 GiB for 4B). Expose exactly `TP_SIZE` devices, and keep the same mesh in both arms. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
-
-```bash
-mkdir -p "$DPO_BENCHMARK_DIR"
-: > "$DPO_BENCHMARK_DIR/xla-default.flags"
-export XLA_FLAGS="$DPO_BENCHMARK_DIR/xla-default.flags"
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-unset XLA_PYTHON_CLIENT_ALLOCATOR XLA_CLIENT_MEM_FRACTION XLA_PYTHON_CLIENT_MEM_FRACTION
-
-MODEL_NAME=qwen3-0.6b
-TP_SIZE=1
-ORCA_COHORT_SHA=45711c62dd9b6a98ab1bfb74eb9beacc479f7fe90e6cc2665948ed2823c1dff3
-
-for chunk_size in 0 128; do
-  python -m benchmarks.dpo_completion_scoring \
-    --model-name "$MODEL_NAME" --tensor-parallel-size "$TP_SIZE" \
-    --checkpoint "$QWEN_CHECKPOINT" --preference-directory "$ORCA_PARQUET" \
-    --cohort-sha256 "$ORCA_COHORT_SHA" \
-    --parity-directory "$DPO_BENCHMARK_DIR/reference" \
-    --output "$DPO_BENCHMARK_DIR/chunk-$chunk_size.json" \
-    --chunk-size "$chunk_size" --warmup 4 --repeats 64 || exit
-done
-```
-
-For Qwen3-1.7B, set `MODEL_NAME=qwen3-1.7b` and `TP_SIZE=1`. For Qwen3-4B, set `MODEL_NAME=qwen3-4b` and `TP_SIZE=2` for automatic tensor sharding on two H100s. Add `--stream-checkpoint` in both arms for these larger checkpoints.
-
-The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence. It reads the completion mask from the final query row of Tunix's key-masked causal matrix and packs valid positions across chosen and rejected rows.
-
-For a three-tile batch with a short final tile, both forward passes project the first two tiles together and use a smaller projection for the last tile. With the recipe above, the packed forward widths are 1,024 and 320 rows. Other batches keep the original 512-row forward tiles. Policy backward keeps 512-row score tiles and computes the target-logit cotangent with a pointwise select that XLA can fuse. It scatters logit cotangents back to their original positions, then applies the full-width projection pullback to preserve BF16 rounding.
-
-The runner checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and AdamW update. The 64 steps cover eight timed passes through the batch cohort. The scorer is enabled in this benchmark. The standard MaxText DPO trainer uses native Tunix scoring.
-
-For peak GPU memory, repeat each passing arm in a fresh process with `--profile-memory` and a separate output path. The profile reuses the verified cohort and runs the same updates without repeating the gradient capture. Sample physical GPU memory on the isolated devices between the `DPO_GPU_MEMORY_WINDOW_BEGIN` and `DPO_GPU_MEMORY_WINDOW_END` log markers. Keep the same allocator settings and report the peak per device. The JSON records allocator counters at each boundary and separate XLA temporary-memory estimates for policy and reference. Use the original runs for latency.
-
-Add `--donate-policy` to let the native AdamW update reuse policy parameter buffers. The frozen reference gets independent device storage and continues to score online.
-
-For the lower-budget BFC runs, use `--chunk-size 0 --donate-policy` at `XLA_CLIENT_MEM_FRACTION=0.55` on Qwen3-1.7B, and `--chunk-size 128 --donate-policy` at `0.60` on Qwen3-4B. Keep preallocation disabled and use the same empty XLA compiler flags file. Run native dense with stock donation at the default BFC budget as the deployment baseline and at the candidate budget as a capacity control. Save gradients from the stock native scorer before running either donated arm. Record each arm's budget with its latency and sampled memory.
-
-##### Precompute a fixed reference
-
-For a fixed checkpoint and tokenized cohort, add `--reference-cache "$DPO_BENCHMARK_DIR/reference-scores.json" --build-reference-cache` to the model and data flags with `--chunk-size 0`. This runs native reference scoring and exits. Use a separate `--output` path for its report. In a new process, pass the same `--reference-cache` with `--chunk-size 0 --donate-policy` and omit `--build-reference-cache`. This run attaches the saved scores to native Tunix inputs and runs the same DPO loss and policy update. The key checks the checkpoint shards, model and scoring code, tokenized cohort, mesh, and compiler options.
-
-Keep the BFC budget identical in the cache process, cached training, and online dense control. Sample memory during cache construction and during training. Compare the maximum of those two cached phases against the online update window. Record cache construction separately from steady p90, and include it in a total or amortized throughput when scoring reuse pays for it. Use preference pairs and completion tokens per second for useful throughput. If reporting model FLOPs utilization, count the reference forward on online steps and account for the one-time scoring separately on the cached path. [MaxText MFU definition](https://maxtext.readthedocs.io/en/maxtext-v0.2.6/reference/performance_metrics.html)
+## Cluster Toolkit benchmarks
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:

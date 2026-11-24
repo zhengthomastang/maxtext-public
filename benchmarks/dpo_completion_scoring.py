@@ -69,6 +69,9 @@ def parse_args():
   parser.add_argument(
       "--profile-memory", action="store_true", help="Mark the full-step window for an external GPU sampler."
   )
+  parser.add_argument(
+      "--skip-compiled-memory-analysis", action="store_true", help="Skip extra executable analysis during cold timing."
+  )
   parser.add_argument("--chunk-size", type=int, required=True)
   parser.add_argument("--pairs-per-step", type=int, default=2)
   parser.add_argument("--cohort-batches", type=int, default=8)
@@ -460,9 +463,9 @@ def time_steps(trainer, args, batches):
   is_update = jnp.asarray(True)
   example = trainer._prepare_inputs(batches[0])
   compiled = step.func.lower(*step.args, example, is_update).compile()
-  policy_memory = compiled_memory(compiled)
+  policy_memory = None if args.skip_compiled_memory_analysis else compiled_memory(compiled)
   reference_memory = None
-  if trainer.ref_model is not None:
+  if trainer.ref_model is not None and not args.skip_compiled_memory_analysis:
     reference = dpo_trainer.compute_logps.lower(
         trainer.ref_model,
         example.input_ids,
