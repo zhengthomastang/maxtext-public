@@ -5,6 +5,28 @@ Two approaches are here:
 1. Run a model recipe with a single CLI command. Great to replicate performance results previously measured. See https://github.com/AI-Hypercomputer/tpu-recipes/tree/main/training/trillium for examples, and [`deepseek3_671b_tpu7x/`](deepseek3_671b_tpu7x/README.md) for DeepSeek-V3 671B FP8 recipes on TPU7x (Ironwood).
 2. Run several experiments pythonically across a sweep of parameters (cluster configuration, maxtext parameters) with Cluster Toolkit workloads.
 
+#### Paired SFT benchmark
+
+`supervised_sft_projection.py` compares the tiled baseline and supervised projection through the native MaxText training step on one GPU. It checks loss, z-loss, and raw gradient parity before timing synchronized AdamW updates from the same checkpoint. It accepts a small built-in fixture or a pretokenized batch cohort.
+
+For example, download the public [QASPER training archive](https://allenai.org/data/qasper) and use a local copy of the [Qwen3-1.7B checkpoint and tokenizer](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e):
+
+```bash
+python -m benchmarks.prepare_qasper_sft_batches \
+  --archive "$QASPER_ARCHIVE" --tokenizer-path "$QWEN_CHECKPOINT" \
+  --tokenizer-revision 70d244cc86ccca08cf5af4e1e306ecf908b1ad5e \
+  --output /tmp/qasper-s4096.npz
+
+python -m benchmarks.supervised_sft_projection \
+  --model-name qwen3-1.7b --dtype bfloat16 --max-target-length 4096 \
+  --checkpoint-layout safetensors_dynamic \
+  --load-parameters-path "$QWEN_CHECKPOINT" --tokenizer-path "$QWEN_CHECKPOINT" \
+  --batches /tmp/qasper-s4096.npz --output-directory /tmp/maxtext-sft-results \
+  --scan-layers true --parity-batches 16 --warmup 4 --repeats 32
+```
+
+The runner checks every batch by default and stops before timing when parity fails. The report includes the batch SHA-256, supervised token counts, per-batch parity, and raw paired timings. Keep model and batch revisions, precision, and device topology fixed for each comparison.
+
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
 
