@@ -72,6 +72,23 @@ In MaxText, the `num_vocab_tiling` configuration controls the number of tiles. T
 ![Illustration of vocabulary tiling.](../../_static/vocab_tiling.png)
 *Figure 2: Vocabulary tiling processes hidden states in tiles to avoid generating the full logits tensor.*
 
+#### Supervised-position projection for SFT
+
+For single-device causal SFT with FP32 or BF16 activations and output-head dropout disabled, set
+`sft_supervised_projection_tiles` to a positive value below `num_vocab_tiling`.
+The decoder still processes the full sequence. With FP32 activations, the loss
+gathers rows whose shifted target segmentation is nonzero. With BF16 activations,
+the scan keeps original tile boundaries and skips tiles with no supervised
+targets. If the selected rows or occupied tiles exceed the configured capacity,
+the step uses the original tiled path.
+
+For example, with a batch of one, sequence length 2,048, and
+`num_vocab_tiling=8`, setting `sft_supervised_projection_tiles=1` uses one
+256-row tile when FP32 targets fit after gathering or BF16 targets occupy a
+single original tile. The default of zero uses all vocabulary tiles.
+For a new BF16 model or input shape, verify loss and raw gradient parity on
+the target workload with the paired SFT benchmark before enabling the option.
+
 ### Other Tiling Methods
 
 Tiling is also crucial for managing data movement across the memory hierarchy (HBM, VMEM, VREGs). It's applied at various levels: manually within low-level custom operations like Pallas kernels (e.g., Splash Attention) to precisely control HBM to VMEM transfers, and automatically by the XLA compiler for standard computations such as matrix multiplications. This hierarchical approach of breaking data into smaller, manageable tiles ensures efficient hardware utilization by pipelining data through stages.

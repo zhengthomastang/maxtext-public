@@ -76,6 +76,12 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
   """
   labels = data["targets"]
   segmentation = data["targets_segmentation"]
+  batch_size, seq_len, _ = hidden_states.shape
+  vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
+  supervised_tiles = config.sft_supervised_projection_tiles
+  skip_empty_bf16_tiles = supervised_tiles > 0 and hidden_states.dtype == jnp.bfloat16
+  if supervised_tiles and model.mesh is not None and model.mesh.size != 1:
+    raise ValueError("sft_supervised_projection_tiles currently requires a single-device mesh.")
   deterministic = not config.enable_dropout if is_train else True
   model_mode = "train"
 
@@ -150,17 +156,17 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
   def _prepare_chunks(hidden_states, labels, segmentation):
     batch_size, seq_len, emb_dim = hidden_states.shape
-    vocab_tile_size = (batch_size * seq_len) // config.num_vocab_tiling
+    num_tiles = (batch_size * seq_len) // vocab_tile_size
 
     reshaped_hidden_states = _reshape(
         hidden_states,
-        (config.num_vocab_tiling, vocab_tile_size, emb_dim),
+        (num_tiles, vocab_tile_size, emb_dim),
         reshaped_hidden_spec,
     )
-    reshaped_labels = _reshape(labels, (config.num_vocab_tiling, vocab_tile_size), reshaped_data_spec)
+    reshaped_labels = _reshape(labels, (num_tiles, vocab_tile_size), reshaped_data_spec)
     reshaped_segmentation = _reshape(
         segmentation,
-        (config.num_vocab_tiling, vocab_tile_size),
+        (num_tiles, vocab_tile_size),
         reshaped_data_spec,
     )
     return (
@@ -189,6 +195,23 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     masked_xent = jnp.sum(chunk_xent * mask)
     masked_z_loss = jnp.sum(chunk_z_loss * mask)
     return masked_xent, masked_z_loss
+
+  def _run_tiles(body, initial_acc, chunk_data, save_hidden_grads=False):
+    if not skip_empty_bf16_tiles:
+      return jax.lax.scan(body, initial_acc, chunk_data)
+
+    # Preserve the full scan geometry for BF16's rounded backward pass.
+    active = jnp.any(chunk_data[2], axis=1)
+    can_skip = jnp.count_nonzero(active) <= supervised_tiles
+
+    def skip_tile(accumulators, tile):
+      return accumulators, jnp.zeros_like(tile[0]) if save_hidden_grads else None
+
+    def maybe_run_tile(accumulators, inputs):
+      tile, has_targets = inputs
+      return jax.lax.cond(can_skip & ~has_targets, skip_tile, body, accumulators, tile)
+
+    return jax.lax.scan(maybe_run_tile, initial_acc, (chunk_data, active))
 
   @jax.custom_vjp
   def chunked_cross_entropy_loss(
@@ -223,7 +246,7 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     # Always accumulate in fp32 — `cross_entropy_with_logits` returns fp32 regardless of
     # logits dtype, and a bf16 carry would mismatch the body output type under lax.scan.
     initial_acc = (jnp.zeros((), dtype=jnp.float32), jnp.zeros((), dtype=jnp.float32))
-    (total_loss, total_z_loss), _ = jax.lax.scan(
+    (total_loss, total_z_loss), _ = _run_tiles(
         _fwd_scan_body, initial_acc, (reshaped_hidden_states, reshaped_labels, reshaped_segmentation)
     )
     return total_loss, total_z_loss
@@ -270,10 +293,11 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
     # scaling by loss_cotangent (1 / total_weights) in _chunked_cross_entropy_loss_bwd.
     initial_grad_head = jax.tree_util.tree_map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), chunk_head_params)
     initial_acc = (jnp.zeros((), dtype=jnp.float32), jnp.zeros((), dtype=jnp.float32), initial_grad_head)
-    (total_loss, total_z_loss, grad_head), grad_reshaped_hidden_states = jax.lax.scan(
+    (total_loss, total_z_loss, grad_head), grad_reshaped_hidden_states = _run_tiles(
         _fwd_and_bwd_scan_body,
         initial_acc,
         (reshaped_hidden_states, reshaped_labels, reshaped_segmentation),
+        save_hidden_grads=True,
     )
     grad_reshaped_hidden_states = _maybe_shard_with_name(grad_reshaped_hidden_states, reshaped_hidden_spec)
     residuals = (
@@ -323,7 +347,25 @@ def vocab_tiling_nnx_loss(model, hidden_states, data, config, is_train):
 
   chunked_cross_entropy_loss.defvjp(_chunked_cross_entropy_loss_fwd, _chunked_cross_entropy_loss_bwd)
 
-  total_loss, total_z_loss = chunked_cross_entropy_loss(
-      head_params, other_params, rest, hidden_states, labels, segmentation
+  operands = (head_params, other_params, rest, hidden_states, labels, segmentation)
+  if not supervised_tiles or skip_empty_bf16_tiles:
+    return chunked_cross_entropy_loss(*operands)
+
+  capacity = supervised_tiles * vocab_tile_size
+
+  def loss_on_supervised_rows(head, other, rest, hidden, labels, segments):
+    rows = hidden.shape[0] * hidden.shape[1]
+    segments = segments.reshape(rows)
+    indices = jnp.nonzero(segments != 0, size=capacity, fill_value=rows)[0]
+    # The sentinel row fills spare capacity with zero-weight examples.
+    features = hidden.reshape(rows, -1).at[indices].get(mode="fill", fill_value=0)
+    targets = labels.reshape(rows).at[indices].get(mode="fill", fill_value=0)
+    weights = segments.at[indices].get(mode="fill", fill_value=0)
+    return chunked_cross_entropy_loss(head, other, rest, features[None], targets[None], weights[None])
+
+  return jax.lax.cond(
+      jnp.count_nonzero(segmentation) <= capacity,
+      loss_on_supervised_rows,
+      chunked_cross_entropy_loss,
+      *operands,
   )
-  return total_loss, total_z_loss

@@ -883,6 +883,13 @@ class LogitsAndLoss(BaseModel):
       1,
       description="Enables memory-saving optimization by tiling cross-entropy loss computation. >1 to enable.",
   )
+  sft_supervised_projection_tiles: NonNegativeInt = Field(
+      0,
+      description=(
+          "Single-device causal SFT with FP32 or BF16 activations. Maximum number of vocabulary tiles to run"
+          " on the sparse path. BF16 preserves original tile boundaries. Zero and overflow use all tiles."
+      ),
+  )
   vocab_tiling_ag_once: bool = Field(
       False,
       description="All gather the output head weight once before the tiled loss so the backward reuses it.",
@@ -7949,6 +7956,15 @@ class MaxTextConfig(
             "Block-diffusion attention with attention='autoselected' or attention='flash' requires hardware='tpu'; "
             "use attention='dot_product' on other hardware."
         )
+    if self.sft_supervised_projection_tiles:
+      if not self.use_sft or self.use_dpo or self.training_objective == "block_diffusion":
+        raise ValueError("sft_supervised_projection_tiles requires causal SFT.")
+      if self.sft_supervised_projection_tiles >= self.num_vocab_tiling:
+        raise ValueError("sft_supervised_projection_tiles must be less than num_vocab_tiling.")
+      if self.dtype not in (DType.FLOAT32, DType.BFLOAT16):
+        raise ValueError("sft_supervised_projection_tiles requires float32 or bfloat16 activations.")
+      if self.enable_dropout and self.dropout_rate:
+        raise ValueError("sft_supervised_projection_tiles requires deterministic output-head dropout.")
     if self.training_objective == "block_diffusion":
       if self.attention_type != AttentionType.BLOCK_DIFFUSION.value:
         raise ValueError("`training_objective='block_diffusion'` requires `attention_type='block_diffusion'`.")

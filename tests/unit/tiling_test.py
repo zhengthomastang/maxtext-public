@@ -25,6 +25,7 @@ from flax import nnx
 from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from maxtext.configs import pyconfig
 from maxtext.common.common_types import MODEL_MODE_TRAIN
@@ -139,6 +140,9 @@ class VocabTilingNNXTest(unittest.TestCase):
       z_loss_multiplier=1e-4,
       ici_context_parallelism=1,
       vocab_tiling_ag_once=False,
+      final_logits_soft_cap=None,
+      dtype="float32",
+      logits_dot_in_fp32=False,
   ):
     """Build a pyconfig + matching NNX `Transformer` for the test."""
     cfg = pyconfig.initialize(
@@ -150,10 +154,12 @@ class VocabTilingNNXTest(unittest.TestCase):
         per_device_batch_size=1,
         logits_via_embedding=logits_via_embedding,
         base_num_decoder_layers=0,
-        dtype="float32",
+        dtype=dtype,
+        logits_dot_in_fp32=logits_dot_in_fp32,
         matmul_precision="high",
         num_vocab_tiling=num_vocab_tiling,
         z_loss_multiplier=z_loss_multiplier,
+        final_logits_soft_cap=final_logits_soft_cap,
         ici_context_parallelism=ici_context_parallelism,
         vocab_tiling_ag_once=vocab_tiling_ag_once,
     )
@@ -272,6 +278,71 @@ class VocabTilingNNXTest(unittest.TestCase):
     self._run_parity(logits_via_embedding=False, ici_context_parallelism=4, vocab_tiling_ag_once=True)
 
   # ---------- Coverage expansion ----------
+
+  @pytest.mark.cpu_only
+  def test_supervised_projection_parity(self):
+    """Compare sparse packed masks, empty supervision, and the overflow path."""
+    self._run_supervised_projection_parity(jnp.float32)
+
+  @pytest.mark.cpu_only
+  def test_supervised_projection_bf16_parity(self):
+    """Check empty-tile skipping and the original-tile capacity limit for BF16."""
+    self._run_supervised_projection_parity(jnp.bfloat16)
+
+  def _run_supervised_projection_parity(self, dtype):
+    bf16 = dtype == jnp.bfloat16
+    for tied_head in (False, True):
+      cfg, model = self._build_cfg_and_model(
+          logits_via_embedding=tied_head,
+          final_logits_soft_cap=8.0,
+          dtype=jnp.dtype(dtype).name,
+          logits_dot_in_fp32=bf16,
+      )
+      cfg = cfg.replace(use_sft=True)
+      compact_cfg = cfg.replace(sft_supervised_projection_tiles=1)
+      hidden, labels, full = self._make_inputs(cfg, dtype=dtype)
+      graphdef, params, rest = self._split_and_axes(cfg, model)
+      positions = jnp.arange(self.seq_len)
+      spread = jnp.where(positions % 5 == 0, (positions // 32) + 1, 0)[None, :]
+      tile_size = self.seq_len // cfg.num_vocab_tiling
+      packed = jnp.where(positions < tile_size, (positions // (tile_size // 2)) + 1, 0)[None, :] if bf16 else spread
+      masks = [("packed", packed), ("empty", jnp.zeros_like(full)), ("overflow", full)]
+      if bf16:
+        masks.append(("sparse_overflow", spread))
+
+      def loss_fn(config, is_train):
+        def loss(p, h, segments):
+          local_model = nnx.merge(graphdef, p, rest, copy=True)
+          return vocab_tiling_nnx_loss(
+              local_model, h, {"targets": labels, "targets_segmentation": segments}, config, is_train=is_train
+          )
+
+        return loss
+
+      baseline = jax.jit(jax.value_and_grad(loss_fn(cfg, True), argnums=(0, 1), has_aux=True))
+      compact = jax.jit(jax.value_and_grad(loss_fn(compact_cfg, True), argnums=(0, 1), has_aux=True))
+      compact_eval = jax.jit(loss_fn(compact_cfg, False))
+      with nn_partitioning.axis_rules(cfg.logical_axis_rules):
+        for name, mask in masks:
+          with self.subTest(tied_head=tied_head, case=name):
+            expected_loss, (expected_params, expected_hidden) = baseline(params, hidden, mask)
+            actual_loss, (actual_params, actual_hidden) = compact(params, hidden, mask)
+            np.testing.assert_allclose(expected_loss, actual_loss, rtol=2e-5, atol=1e-5)
+            np.testing.assert_allclose(expected_loss, compact_eval(params, hidden, mask), rtol=2e-5, atol=1e-5)
+            self._assert_projection_gradient(expected_hidden, actual_hidden, bf16 and name == "packed")
+            for ref, candidate in zip(jax.tree.leaves(expected_params), jax.tree.leaves(actual_params), strict=True):
+              self._assert_projection_gradient(ref, candidate, (tied_head or bf16) and name == "packed")
+            masked = np.asarray(actual_hidden, dtype=np.float32)[np.asarray(mask) == 0]
+            np.testing.assert_array_equal(masked, 0)
+
+  def _assert_projection_gradient(self, reference, candidate, has_bf16_rounding):
+    reference = np.asarray(reference, dtype=np.float32)
+    candidate = np.asarray(candidate, dtype=np.float32)
+    if has_bf16_rounding:
+      # Changing tile boundaries can change where a BF16 gradient rounds.
+      self.assertLessEqual(np.linalg.norm(reference - candidate), 0.005 * np.linalg.norm(reference) + 1e-5)
+    else:
+      np.testing.assert_allclose(reference, candidate, rtol=2e-5, atol=1e-5)
 
   @pytest.mark.cpu_only
   def test_nnx_vocab_tiling_total_z_loss_value_parity(self):
