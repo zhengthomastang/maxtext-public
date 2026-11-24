@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark dense and chunked BF16 DPO scoring on Qwen3-0.6B.
+"""Benchmark dense and chunked BF16 DPO scoring on Qwen3.
 
 Run each arm in a separate process with the same checkpoint, ORCA Parquet
 directory, and parity directory. See Getting_Started_Benchmarking.md.
@@ -52,10 +52,17 @@ GRADIENT_RELATIVE_L2_GATE = 0.005
 
 def parse_args():
   parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+  parser.add_argument("--model-name", choices=("qwen3-0.6b", "qwen3-1.7b", "qwen3-4b"), default="qwen3-0.6b")
   parser.add_argument("--checkpoint", type=Path, required=True)
   parser.add_argument("--preference-directory", type=Path, required=True)
   parser.add_argument("--parity-directory", type=Path, required=True)
   parser.add_argument("--output", type=Path, required=True)
+  parser.add_argument("--cohort-sha256", help="Require this exact tokenized cohort in both arms.")
+  parser.add_argument("--tensor-parallel-size", type=int, default=1)
+  parser.add_argument("--stream-checkpoint", action="store_true", help="Stream the dynamic safetensors conversion.")
+  parser.add_argument(
+      "--profile-memory", action="store_true", help="Mark the full-step window for an external GPU sampler."
+  )
   parser.add_argument("--chunk-size", type=int, required=True)
   parser.add_argument("--pairs-per-step", type=int, default=2)
   parser.add_argument("--cohort-batches", type=int, default=8)
@@ -66,8 +73,18 @@ def parse_args():
   args = parser.parse_args()
   if args.chunk_size < 0:
     parser.error("Use a nonnegative chunk size. Zero selects the dense scorer.")
+  if args.profile_memory and not args.cohort_sha256:
+    parser.error("--profile-memory requires --cohort-sha256 from the completed parity run.")
   if (
-      min(args.repeats, args.warmup, args.cohort_batches, args.pairs_per_step, args.prompt_slots, args.completion_slots)
+      min(
+          args.repeats,
+          args.warmup,
+          args.cohort_batches,
+          args.pairs_per_step,
+          args.prompt_slots,
+          args.completion_slots,
+          args.tensor_parallel_size,
+      )
       < 1
   ):
     parser.error("Counts and widths must be positive.")
@@ -78,7 +95,7 @@ def make_config(args):
   fields = {
       "run_name": "dpo-memory-probe",
       "base_output_directory": str(args.output.parent.resolve()),
-      "model_name": "qwen3-0.6b",
+      "model_name": args.model_name,
       "load_parameters_path": str(args.checkpoint.resolve()),
       "source_checkpoint_layout": "safetensors_dynamic",
       "tokenizer_path": str(args.checkpoint.resolve()),
@@ -86,7 +103,7 @@ def make_config(args):
       "hardware": "gpu" if jax.default_backend() == "gpu" else "cpu",
       "max_target_length": args.prompt_slots + args.completion_slots,
       "max_prefill_predict_length": min(128, args.prompt_slots),
-      "per_device_batch_size": args.pairs_per_step,
+      "per_device_batch_size": args.pairs_per_step / args.tensor_parallel_size,
       "steps": args.warmup + args.repeats,
       "scan_layers": "true",
       "dtype": "bfloat16",
@@ -102,6 +119,10 @@ def make_config(args):
       "skip_jax_distributed_system": "true",
       "log_config": "false",
   }
+  if args.tensor_parallel_size > 1:
+    fields.update(ici_tensor_parallelism=args.tensor_parallel_size, ici_fsdp_parallelism=1, shard_mode="auto")
+  if args.stream_checkpoint:
+    fields["safetensors_dynamic_streaming"] = "true"
   path = Path(MAXTEXT_PKG_DIR) / "configs" / "post_train" / "dpo.yml"
   return pyconfig.initialize([None, str(path), *(f"{key}={value}" for key, value in fields.items())])
 
@@ -364,11 +385,13 @@ def compare_with_saved_gradients(root, gradient, save):
 def parity(trainer, args, batches, cohort):
   dense = args.chunk_size == 0
   cohort_path = args.parity_directory / "cohort.json"
-  if dense:
+  if dense and not args.profile_memory:
     args.parity_directory.mkdir(parents=True, exist_ok=True)
     cohort_path.write_text(json.dumps(cohort), encoding="utf-8")
   elif json.loads(cohort_path.read_text(encoding="utf-8")) != json.loads(json.dumps(cohort)):
     raise ValueError("Tokenized preference inputs differ between arms.")
+  if args.profile_memory:
+    return []
 
   results = []
   for index, batch in enumerate(batches):
@@ -410,6 +433,16 @@ def compiled_memory(executable):
   return {name: int(getattr(analysis, name)) for name in fields}
 
 
+def allocator_memory():
+  """Snapshot allocator counters without resetting the process high-water mark."""
+  fields = ("bytes_in_use", "peak_bytes_in_use", "bytes_reserved", "peak_bytes_reserved")
+  per_device = {}
+  for device in jax.local_devices():
+    stats = device.memory_stats() or {}
+    per_device[device.id] = {name: int(stats[name]) for name in fields if stats.get(name) is not None}
+  return per_device
+
+
 def time_steps(trainer, args, batches):
   """Time frozen reference preparation and the compiled native policy update."""
   step, _ = trainer.jit_train_and_eval_step()
@@ -429,6 +462,9 @@ def time_steps(trainer, args, batches):
   del reference, example
   samples = []
   losses = []
+  if args.profile_memory:
+    before = allocator_memory()
+    print("DPO_GPU_MEMORY_WINDOW_BEGIN", flush=True)
   for index in range(args.warmup + args.repeats):
     batch = batches[index % len(batches)]
     start = perf_counter()
@@ -437,22 +473,28 @@ def time_steps(trainer, args, batches):
     if index >= args.warmup:
       samples.append((perf_counter() - start) * 1000)
       losses.append(float(loss))
+  memory = {
+      "policy_step_compiled_memory": policy_memory,
+      "reference_forward_compiled_memory": reference_memory,
+  }
+  if args.profile_memory:
+    print("DPO_GPU_MEMORY_WINDOW_END", flush=True)
+    return {**memory, "allocator_before_steps": before, "allocator_after_steps": allocator_memory()}
   p10, median, p90 = np.percentile(samples, (10, 50, 90))
   return {
+      **memory,
       "p10_ms": float(p10),
       "median_ms": float(median),
       "p90_ms": float(p90),
       "samples_ms": samples,
       "training_losses": losses,
-      "policy_step_compiled_memory": policy_memory,
-      "reference_forward_compiled_memory": reference_memory,
   }
 
 
 def main():
   args = parse_args()
-  if jax.device_count() != 1:
-    raise RuntimeError("Expose exactly one accelerator to this probe.")
+  if jax.device_count() != args.tensor_parallel_size:
+    raise RuntimeError("Expose exactly the requested number of accelerators to this benchmark.")
   args.output.parent.mkdir(parents=True, exist_ok=True)
   cfg = make_config(args)
   mesh = maxtext_utils.get_mesh_from_config(cfg)
@@ -480,6 +522,8 @@ def main():
         ),
     )
     batches, cohort = preference_batches(args, tokenizer_adapter.TokenizerAdapter(tokenizer))
+    if args.cohort_sha256 and cohort["tokenized_sha256"] != args.cohort_sha256:
+      raise ValueError(f'Tokenized cohort differs from --cohort-sha256: {cohort["tokenized_sha256"]}')
     numerical_checks = parity(trainer, args, batches, cohort)
     passes = all(result["passed"] is not False for result in numerical_checks)
     timing = time_steps(trainer, args, batches) if passes else None
@@ -489,9 +533,10 @@ def main():
     tunix_version = None
   report = {
       "scope": "native_tunix_dpo_step_with_maxtext_model",
-      "status": "timed" if passes else "parity_failed",
-      "model": "qwen3-0.6b",
+      "status": "profiled_memory" if args.profile_memory else "timed" if passes else "parity_failed",
+      "model": args.model_name,
       "device": jax.devices()[0].device_kind,
+      "tensor_parallel_size": args.tensor_parallel_size,
       "jax": jax.__version__,
       "tunix_version": tunix_version,
       "dtype": "bfloat16",
@@ -500,6 +545,8 @@ def main():
       "chunk_size": args.chunk_size,
       "scorer": "compact_completion_rows_paired_tail" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
+      "xla_python_client_allocator": os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR"),
+      "xla_python_client_preallocate": os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE"),
       "pairs_per_step": args.pairs_per_step,
       "prompt_slots": args.prompt_slots,
       "completion_slots": args.completion_slots,

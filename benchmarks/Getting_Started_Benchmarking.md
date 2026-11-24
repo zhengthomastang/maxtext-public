@@ -39,16 +39,23 @@ Keep XLA compiler defaults for the primary comparison. Explicit sharding and `--
 
 #### Paired BF16 DPO benchmark
 
-Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/commit/21fa70f92aadd966cea68efcb73c9786710b8c46) and expose one H100. Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B snapshot](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), `ORCA_PARQUET` to a directory containing the pinned [Argilla ORCA training Parquet](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896), and `DPO_BENCHMARK_DIR` to a scratch directory with at least 20 GiB free for saved raw gradients. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
+Use a MaxText post-training environment with [Tunix at the tested revision](https://github.com/google/tunix/commit/21fa70f92aadd966cea68efcb73c9786710b8c46). Set `QWEN_CHECKPOINT` to a local [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B/tree/c1899de289a04d12100db370d81485cdf75e47ca), [Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B/tree/70d244cc86ccca08cf5af4e1e306ecf908b1ad5e), or [Qwen3-4B](https://huggingface.co/Qwen/Qwen3-4B/tree/1cfa9a7208912126459214e8b04321603b3df60c) snapshot. Set `ORCA_PARQUET` to the pinned [Argilla ORCA training Parquet directory](https://huggingface.co/datasets/argilla/distilabel-intel-orca-dpo-pairs/tree/0b10ec0df32c919f95126b203c8f5962b6875896). Use a distinct `DPO_BENCHMARK_DIR` per model and device mesh, with room for raw gradients (20 GiB for 0.6B and 128 GiB for 4B). Expose exactly `TP_SIZE` devices, and keep the same mesh in both arms. An empty XLA flags file keeps compiler defaults and prevents MaxText from adding HLO dump flags.
 
 ```bash
 mkdir -p "$DPO_BENCHMARK_DIR"
 : > "$DPO_BENCHMARK_DIR/xla-default.flags"
 export XLA_FLAGS="$DPO_BENCHMARK_DIR/xla-default.flags"
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+
+MODEL_NAME=qwen3-0.6b
+TP_SIZE=1
+ORCA_COHORT_SHA=45711c62dd9b6a98ab1bfb74eb9beacc479f7fe90e6cc2665948ed2823c1dff3
 
 for chunk_size in 0 128; do
   python -m benchmarks.dpo_completion_scoring \
+    --model-name "$MODEL_NAME" --tensor-parallel-size "$TP_SIZE" \
     --checkpoint "$QWEN_CHECKPOINT" --preference-directory "$ORCA_PARQUET" \
+    --cohort-sha256 "$ORCA_COHORT_SHA" \
     --parity-directory "$DPO_BENCHMARK_DIR/reference" \
     --output "$DPO_BENCHMARK_DIR/chunk-$chunk_size.json" \
     --chunk-size "$chunk_size" --warmup 4 --repeats 64 || exit
@@ -59,7 +66,9 @@ The first process uses native Tunix dense scores. The second keeps final normali
 
 For a three-tile batch with a short final tile, both forward passes project the first two tiles together and use a smaller projection for the last tile. With the recipe above, the packed forward widths are 1,024 and 320 rows. Other batches keep the original 512-row forward tiles. Policy backward keeps 512-row score tiles and computes the target-logit cotangent with a pointwise select that XLA can fuse. It scatters logit cotangents back to their original positions, then applies the full-width projection pullback to preserve BF16 rounding.
 
-The runner checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and AdamW update. The 64 steps cover eight timed passes through the batch cohort. XLA reports separate temporary-memory estimates for the reference and policy. The scorer is enabled in this benchmark. The standard MaxText DPO trainer uses native Tunix scoring.
+The runner checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and AdamW update. The 64 steps cover eight timed passes through the batch cohort. The scorer is enabled in this benchmark. The standard MaxText DPO trainer uses native Tunix scoring.
+
+For peak GPU memory, repeat each passing arm in a fresh process with `--profile-memory` and a separate output path. The profile reuses the verified cohort and runs the same updates without repeating the gradient capture. Sample physical GPU memory on the isolated devices between the `DPO_GPU_MEMORY_WINDOW_BEGIN` and `DPO_GPU_MEMORY_WINDOW_END` log markers. Keep the same allocator settings and report the peak per device. The JSON records allocator counters at each boundary and separate XLA temporary-memory estimates for policy and reference. Use the original runs for latency.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:
