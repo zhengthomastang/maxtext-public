@@ -51,11 +51,15 @@ for chunk_size in 0 128; do
     --checkpoint "$QWEN_CHECKPOINT" --preference-directory "$ORCA_PARQUET" \
     --parity-directory "$DPO_BENCHMARK_DIR/reference" \
     --output "$DPO_BENCHMARK_DIR/chunk-$chunk_size.json" \
-    --chunk-size "$chunk_size" || exit
+    --chunk-size "$chunk_size" --warmup 4 --repeats 64 || exit
 done
 ```
 
-The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence. It reads the completion mask from the final query row of Tunix's key-masked causal matrix and packs valid positions across chosen and rejected rows. It runs one projection tile per group of valid positions. The backward pass scatters logit cotangents back to their original positions, then applies the full-width projection pullback to preserve BF16 rounding. It checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and the AdamW update. Read the policy and reference XLA temporary estimates separately. The benchmark has its own scorer injection, and the normal MaxText DPO trainer continues to use native Tunix scoring.
+The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence. It reads the completion mask from the final query row of Tunix's key-masked causal matrix and packs valid positions across chosen and rejected rows.
+
+For a three-tile batch with a short final tile, both forward passes project the first two tiles together and use a smaller projection for the last tile. With the recipe above, the packed forward widths are 1,024 and 320 rows. Other batches keep the original 512-row forward tiles. Policy backward keeps 512-row score tiles and computes the target-logit cotangent with a pointwise select that XLA can fuse. It scatters logit cotangents back to their original positions, then applies the full-width projection pullback to preserve BF16 rounding.
+
+The runner checks all eight matched batches at a **0.5%** raw-gradient relative L2 gate before timing. Both arms time the frozen reference, policy forward and backward, and AdamW update. The 64 steps cover eight timed passes through the batch cohort. XLA reports separate temporary-memory estimates for the reference and policy. The scorer is enabled in this benchmark. The standard MaxText DPO trainer uses native Tunix scoring.
 
 For new GKE runs, submit each benchmark as a Cluster Toolkit JobSet. Authenticate
 to the cluster and configure `gcluster` before submitting:

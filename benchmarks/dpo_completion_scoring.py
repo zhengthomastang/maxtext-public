@@ -169,18 +169,61 @@ def active_rows(mask, tile_rows):
   return positions, (count + tile_rows - 1) // tile_rows
 
 
-def tile_inputs(position_tiles, index, hidden, targets):
-  positions = position_tiles[index]
+def tile_inputs(positions, hidden, targets):
   selected = jnp.take(hidden, positions, axis=0, mode="fill", fill_value=0)
   selected = jnp.where(jnp.isfinite(selected), selected, 0)
   ids = jnp.take(targets, positions, axis=0, mode="fill", fill_value=0)
   return positions, selected, ids
 
 
+def compact_forward_tiles(positions, tiles, capacity, buffer, write_tile):
+  """Stream the forward projection, coalescing the first two tiles when the third is short."""
+
+  def write_tiles(result):
+    return jax.lax.fori_loop(0, tiles, lambda i, b: write_tile(positions[i], b), result)
+
+  tile_rows = positions.shape[1]
+  short_rows = tile_rows * 5 // 8 // 32 * 32
+  if positions.shape[0] < 3 or not short_rows:
+    return write_tiles(buffer)
+
+  coalesced_rows = 2 * tile_rows + short_rows
+  flat_positions = positions.reshape(-1)
+  short_third_tile = (tiles == 3) & (flat_positions[coalesced_rows] >= capacity)
+
+  def write_pair_and_tail(result):
+    pair_rows = 2 * tile_rows
+    result = write_tile(flat_positions[:pair_rows], result)
+    return write_tile(flat_positions[pair_rows:coalesced_rows], result)
+
+  return jax.lax.cond(short_third_tile, write_pair_and_tail, write_tiles, buffer)
+
+
 def is_head(path, variable):
   return isinstance(variable, nnx.Param) and any(
       str(part) in {"token_embedder", "decoder_norm", "logits_dense"} for part in path
   )
+
+
+def selective_logps_with_fusible_gather(logits, ids):
+  """Keep Tunix log-softmax math and permit fusion of the gather transpose."""
+  vocabulary_size = logits.shape[-1]
+
+  @jax.custom_vjp
+  def gather(values, targets):
+    return jnp.take_along_axis(values, targets[..., None], axis=-1)
+
+  def forward(values, targets):
+    return gather(values, targets), targets
+
+  def backward(targets, cotangent):
+    vocabulary = jnp.arange(vocabulary_size, dtype=targets.dtype)
+    return jnp.where(vocabulary == targets[..., None], cotangent, 0), None
+
+  gather.defvjp(forward, backward)
+  safe_logits = jnp.where(jnp.isnan(logits), -1e9, jnp.clip(logits.astype(jnp.float32), min=-1e9, max=1e9))
+  logps = gather(safe_logits, ids) - jax.nn.logsumexp(safe_logits, axis=-1, keepdims=True)
+  return logps.squeeze(-1)
 
 
 def compact_score(model, hidden, targets, mask, tile_rows):
@@ -208,12 +251,14 @@ def compact_score(model, hidden, targets, mask, tile_rows):
     rows, project = head_parts(params, state, states)
     flat_ids = ids.reshape(-1)
 
-    def score_tile(index, buffer):
-      locations, selected, tokens = tile_inputs(positions, index, rows, flat_ids)
+    def score_tile(locations, buffer):
+      locations, selected, tokens = tile_inputs(locations, rows, flat_ids)
       scores = common.selective_log_softmax(project(selected), tokens)
       return buffer.at[locations].set(scores, mode="drop", indices_are_sorted=True, unique_indices=True)
 
-    scores = jax.lax.fori_loop(0, tiles, score_tile, jnp.zeros(batch * completion, jnp.float32))
+    scores = compact_forward_tiles(
+        positions, tiles, batch * completion, jnp.zeros(batch * completion, jnp.float32), score_tile
+    )
     return scores.reshape(batch, completion)
 
   @jax.custom_vjp
@@ -236,17 +281,17 @@ def compact_score(model, hidden, targets, mask, tile_rows):
     # The full projection shape preserves BF16 rounding in the pullback.
     logits, pullback = jax.vjp(full_projection, params, states)
 
-    def write_tile(index, buffer):
-      locations, selected, tokens = tile_inputs(positions, index, rows, flat_ids)
+    def write_tile(locations, buffer):
+      locations, selected, tokens = tile_inputs(locations, rows, flat_ids)
       score_cotangent = jnp.take(flat_score_cotangent, locations, axis=0, mode="fill", fill_value=0)
       values = project(selected)
-      _, score_vjp = jax.vjp(lambda logits: common.selective_log_softmax(logits, tokens), values)
+      _, score_vjp = jax.vjp(lambda logits: selective_logps_with_fusible_gather(logits, tokens), values)
       (gradient,) = score_vjp(score_cotangent)
       destination = (locations // completion) * sequence + completion_start + locations % completion
       return buffer.at[destination].set(gradient, mode="drop", indices_are_sorted=True, unique_indices=True)
 
     shape = batch * sequence, logits.shape[-1]
-    gradient = jax.lax.fori_loop(0, tiles, write_tile, jnp.zeros(shape, logits.dtype))
+    gradient = jax.lax.fori_loop(0, tiles, lambda i, b: write_tile(positions[i], b), jnp.zeros(shape, logits.dtype))
     parameter_cotangent, hidden_cotangent = pullback(gradient.reshape(logits.shape))
     return parameter_cotangent, None, hidden_cotangent, None, None, None
 
@@ -453,7 +498,7 @@ def main():
       "weight_dtype": "float32",
       "optimizer": cfg.opt_type,
       "chunk_size": args.chunk_size,
-      "scorer": "compact_completion_rows_streamed_cotangent" if args.chunk_size else "dense",
+      "scorer": "compact_completion_rows_paired_tail" if args.chunk_size else "dense",
       "xla_flags": os.environ.get("XLA_FLAGS", ""),
       "pairs_per_step": args.pairs_per_step,
       "prompt_slots": args.prompt_slots,
