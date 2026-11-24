@@ -46,6 +46,7 @@ mkdir -p "$DPO_BENCHMARK_DIR"
 : > "$DPO_BENCHMARK_DIR/xla-default.flags"
 export XLA_FLAGS="$DPO_BENCHMARK_DIR/xla-default.flags"
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
+unset XLA_PYTHON_CLIENT_ALLOCATOR XLA_CLIENT_MEM_FRACTION XLA_PYTHON_CLIENT_MEM_FRACTION
 
 MODEL_NAME=qwen3-0.6b
 TP_SIZE=1
@@ -61,6 +62,8 @@ for chunk_size in 0 128; do
     --chunk-size "$chunk_size" --warmup 4 --repeats 64 || exit
 done
 ```
+
+For Qwen3-1.7B, set `MODEL_NAME=qwen3-1.7b` and `TP_SIZE=1`. For Qwen3-4B, set `MODEL_NAME=qwen3-4b` and `TP_SIZE=2` for automatic tensor sharding on two H100s. Add `--stream-checkpoint` in both arms for these larger checkpoints.
 
 The first process uses native Tunix dense scores. The second keeps final normalization on the full sequence. It reads the completion mask from the final query row of Tunix's key-masked causal matrix and packs valid positions across chosen and rejected rows.
 
