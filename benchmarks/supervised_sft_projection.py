@@ -38,6 +38,7 @@ def parse_args():
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument("--load-parameters-path", required=True)
   parser.add_argument("--checkpoint-layout", choices=["orbax", "safetensors_dynamic"], default="orbax")
+  parser.add_argument("--stream-checkpoint", action="store_true", help="Stream the dynamic safetensors conversion.")
   parser.add_argument("--tokenizer-path", required=True)
   parser.add_argument("--model-name", default="qwen3-0.6b")
   parser.add_argument("--output-directory", required=True, type=Path)
@@ -61,6 +62,7 @@ def parse_args():
   parser.add_argument("--scan-layers", choices=["true", "false"])
   parser.add_argument("--warmup", default=3, type=int)
   parser.add_argument("--repeats", default=12, type=int)
+  parser.add_argument("--sequential-arms", action="store_true", help="Load and time one training state at a time.")
   parser.add_argument("--loss-rtol", default=1e-5, type=float)
   parser.add_argument("--gradient-relative-l2-tolerance", default=5e-3, type=float)
   args = parser.parse_args()
@@ -70,6 +72,8 @@ def parse_args():
     parser.error("Require positive batch counts and a sequence length of at least two.")
   if args.tensor_parallel_size < 1 or (args.tensor_parallel_size > 1 and args.dtype != "bfloat16"):
     parser.error("Use a positive tensor parallel size. Multi-GPU supervised projection requires BF16.")
+  if args.stream_checkpoint and args.checkpoint_layout != "safetensors_dynamic":
+    parser.error("--stream-checkpoint requires --checkpoint-layout safetensors_dynamic.")
   if tile_count < 2 or (batch * seq) % tile_count:
     parser.error("Use at least two tiles that divide the number of batch positions.")
   if not 0 < args.projection_tiles < tile_count:
@@ -128,6 +132,8 @@ def make_config(args, name, projection_tiles):
     overrides["scan_layers"] = args.scan_layers
   if args.shard_mode is not None:
     overrides["shard_mode"] = args.shard_mode
+  if args.stream_checkpoint:
+    overrides["safetensors_dynamic_streaming"] = "true"
   if args.tensor_parallel_size > 1:
     overrides["ici_tensor_parallelism"] = args.tensor_parallel_size
     overrides["ici_fsdp_parallelism"] = 1
@@ -262,6 +268,37 @@ def full_step(config, graph, state, shardings, mesh, batch):
   return executable, (perf_counter() - start) * 1000
 
 
+def time_steps(args, executables, states, batches):
+  """Replay a fixed batch sequence and alternate the order of resident arms."""
+  samples = {name: [] for name in executables}
+  names = tuple(executables)
+  for step in range(args.warmup + args.repeats):
+    batch = batches[step % len(batches)]
+    for name in names if step % 2 == 0 else reversed(names):
+      start = perf_counter()
+      states[name], _ = jax.block_until_ready(executables[name](states[name], batch))
+      if step >= args.warmup:
+        samples[name].append((perf_counter() - start) * 1000)
+  return samples
+
+
+def time_sequential_arm(args, name, config, initial_config, batches):
+  """Start each arm from the same checkpoint and fresh optimizer state."""
+  print(f"Loading the checkpoint for the {name} arm", flush=True)
+  _, manager, shardings, model, mesh, *_, initial = train_utils.setup_train_loop(initial_config, recorder=None)
+  try:
+    graph, state = nnx.split(initial)
+    del initial, model
+    with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
+      executable, compile_ms = full_step(config, graph, state, shardings, mesh, batches[0])
+    states = {name: state}
+    del state
+    return time_steps(args, {name: executable}, states, batches)[name], compile_ms
+  finally:
+    if manager is not None:
+      manager.close()
+
+
 def summarize(samples):
   p10, median, p90 = np.percentile(samples, [10, 50, 90])
   return {"p10_ms": float(p10), "median_ms": float(median), "p90_ms": float(p90), "samples_ms": samples}
@@ -316,6 +353,9 @@ def main():
     data_sharding = sharding.get_input_data_sharding(baseline_config, mesh)
     batches = jax.block_until_ready([jax.device_put(batch, data_sharding) for batch in host_batches])
     parity_fns = {name: make_loss_and_gradient(model, config) for name, config in configs.items()}
+    if args.sequential_arms:
+      # Parity uses model parameters and raw gradients only.
+      del initial
     parity = []
     for index, batch in enumerate(batches[: args.parity_batches]):
       results = {}
@@ -334,29 +374,28 @@ def main():
       raise AssertionError(f"Worst gradient relative L2 error {worst_gradient_error:.6g} exceeds tolerance.")
     del parity_fns, model
 
-    graph, original = nnx.split(initial)
-    del initial
-    candidate_state = jax.block_until_ready(jax.tree.map(lambda x: x.copy() if isinstance(x, jax.Array) else x, original))
-    states = {"tiled": original, "supervised": candidate_state}
-    del original, candidate_state
-    executables, compile_times = {}, {}
-    for name, config in configs.items():
-      with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
-        executables[name], compile_times[name] = full_step(config, graph, states[name], shardings, mesh, batches[0])
+    samples, compile_times = {}, {}
+    if args.sequential_arms:
+      if manager is not None:
+        manager.close()
+        manager = None
+      for name, config in configs.items():
+        samples[name], compile_times[name] = time_sequential_arm(args, name, config, baseline_config, batches)
+    else:
+      graph, original = nnx.split(initial)
+      del initial
+      candidate_state = jax.block_until_ready(
+          jax.tree.map(lambda x: x.copy() if isinstance(x, jax.Array) else x, original)
+      )
+      states = {"tiled": original, "supervised": candidate_state}
+      del original, candidate_state
+      executables = {}
+      for name, config in configs.items():
+        with jax.set_mesh(mesh), logical_axis_rules(config.logical_axis_rules):
+          executables[name], compile_times[name] = full_step(config, graph, states[name], shardings, mesh, batches[0])
+      samples = time_steps(args, executables, states, batches)
 
-    samples = {name: [] for name in configs}
-    timed_batch_indices = []
-    for step in range(args.warmup + args.repeats):
-      batch_index = step % len(batches)
-      batch = batches[batch_index]
-      if step >= args.warmup:
-        timed_batch_indices.append(batch_index)
-      names = tuple(configs) if step % 2 == 0 else tuple(reversed(configs))
-      for name in names:
-        start = perf_counter()
-        states[name], _ = jax.block_until_ready(executables[name](states[name], batch))
-        if step >= args.warmup:
-          samples[name].append((perf_counter() - start) * 1000)
+    timed_batch_indices = [step % len(batches) for step in range(args.warmup, args.warmup + args.repeats)]
     timed_tokens = sum(source["input_tokens_by_batch"][index] for index in timed_batch_indices)
     full_step_metrics = {
         name: {**summarize(values), "input_tokens_per_second": 1000 * timed_tokens / sum(values)}
@@ -373,6 +412,7 @@ def main():
         "model": args.model_name,
         "checkpoint": args.load_parameters_path,
         "checkpoint_layout": args.checkpoint_layout,
+        "checkpoint_streaming": args.stream_checkpoint,
         "dtype": baseline_config.dtype.name.lower(),
         "weight_dtype": "float32",
         "grad_dtype": "float32",
@@ -386,6 +426,7 @@ def main():
         "num_vocab_tiling": args.num_vocab_tiling,
         "projection_tiles": args.projection_tiles,
         "warmup": args.warmup,
+        "timing_order": "sequential_arms" if args.sequential_arms else "interleaved",
         "input": source,
         "parity": parity,
         "worst_gradient_relative_l2_error": worst_gradient_error,

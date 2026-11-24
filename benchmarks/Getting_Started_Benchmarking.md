@@ -27,6 +27,11 @@ python -m benchmarks.supervised_sft_projection \
 
 Repeat with the Qwen3-0.6B checkpoint and `--model-name qwen3-0.6b` to compare model sizes on the same NPZ.
 For Qwen3-4B and Qwen3-8B with the same AdamW recipe, expose four NVLink-connected H100 80 GB GPUs to JAX and add `--tensor-parallel-size 4 --shard-mode auto`. Use each model's checkpoint and change `--model-name` to `qwen3-4b` or `qwen3-8b`. Both arms use automatic sharding and the same replicated global batch. Keep XLA at its default settings for this comparison. Use `--shard-mode explicit` for a separate matched comparison.
+
+For Qwen3-14B and Qwen3-32B, expose eight NVLink-connected H100 80 GB GPUs and add `--tensor-parallel-size 8 --shard-mode auto --stream-checkpoint --sequential-arms`. Use the same NPZ with `--model-name qwen3-14b` and the [14B checkpoint](https://huggingface.co/Qwen/Qwen3-14B/tree/40c069824f4251a91eefaf281ebe4c544efd3e18) or `--model-name qwen3-32b` and the [32B checkpoint](https://huggingface.co/Qwen/Qwen3-32B/tree/9216db5781bf21249d130ec9da846c4624c16137). Sequential timing reloads the checkpoint and initializes fresh optimizer state for each arm. Both arms replay the same batches from the first warm-up. Loading and compilation are outside the timing. The report records the timing order.
+
+For the eight-H100 runs, set `XLA_PYTHON_CLIENT_ALLOCATOR=cuda_async`, `XLA_CLIENT_MEM_FRACTION=0.96`, and `XLA_PYTHON_CLIENT_PREALLOCATE=false` in both arms. The default allocator failed on a temporary-buffer allocation during the 32B tiled step on the test pod. Keep XLA compiler flags at their defaults. [JAX GPU memory allocation](https://docs.jax.dev/en/latest/gpu_memory_allocation.html)
+
 For a separate deterministic comparison, add `--compile-xla-flags=--xla_gpu_deterministic_ops=True`.
 The runner applies that option to both arms for parity and timing. It can change XLA kernel selection and step time, so compare medians from the same compiler settings.
 
